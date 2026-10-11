@@ -1,0 +1,1915 @@
+--[[
+    NPC Walker v12 — идти к ближайшему NPC
+    Новое в v12:
+      • Безопасная зона теперь включается при HP <= 50 (было 30).
+      • Отсчёт 10 секунд для выхода из зоны идёт ТОЛЬКО когда персонаж уже стоит в зоне
+        и HP выше 50. Пока он идёт к зоне, отсчёта нет.
+      • После смерти в зону не идём: при респавне все состояния зоны/отхода сбрасываются.
+      • Клик после смерти: через 5 секунд — 2 нажатия с паузой 0.5 сек в выбранную точку экрана.
+        Точка выбирается стрелками (кнопка «Выбрать точку клика»), на экране виден маркер.
+    Из v11:
+      • Выход из зоны: если HP остаётся выше порога непрерывно 10 секунд — зона отключается,
+        персонаж снова преследует цель, пока HP не упадёт до порога и ниже.
+    Из v10:
+      • Персонаж ВСЕГДА смотрит на ближайшую цель (даже когда стоит или отступает)
+      • Безопасная зона (4 точки): персонаж уходит в неё и не выходит за неё.
+        Ограничение снимается, когда пропадают ВСЕ цели.
+      • Автозапуск: при запуске скрипта сразу включаются ходьба к цели (режим «Авто (умный)»),
+        ФАРМ и всё остальное. Скорость скольжения по умолчанию 15.
+      • Пересоздание кнопки ФАРМ только если FPS <= 15 держится 20 секунд подряд.
+    Движение: плавное скольжение (LinearVelocity), скорость не зависит от WalkSpeed.
+    Отступление: при HP <= 50 скольжение от цели, пока HP не станет выше 50.
+    ФАРМ (одна кнопка) включает:
+      1) авто-скип Bossbar, когда в радиусе 500 студов нет целей
+      2) авто-кликер в центр экрана
+      3) после смерти: клавиша 2 -> (почти сразу) клавиша 1, раз в 5 сек, 30 сек
+      4) после смерти: нажатие кнопки Ready, раз в секунду, 10 сек
+    Куда вставлять: LocalScript в StarterPlayer > StarterPlayerScripts (или запуск через экзекутор)
+]]
+
+local Players = game:GetService("Players")
+local UserInputService = game:GetService("UserInputService")
+local TweenService = game:GetService("TweenService")
+local RunService = game:GetService("RunService")
+local CollectionService = game:GetService("CollectionService")
+
+local player = Players.LocalPlayer
+local playerGui = player:WaitForChild("PlayerGui")
+
+------------------------------------------------------------
+-- Настройки
+------------------------------------------------------------
+local RETREAT_HP = 50            -- при HP <= этого значения отступаем, пока HP не станет выше
+
+-- Безопасная зона (углы по порядку обхода) — Y не учитывается
+local ZONE_HP = 50               -- при HP <= этого значения уходим в зону
+
+-- Клик после смерти: через DEATH_CLICK_DELAY сек — DEATH_CLICK_COUNT нажатий с паузой DEATH_CLICK_GAP
+local DEATH_CLICK_DELAY = 5
+local DEATH_CLICK_COUNT = 2
+local DEATH_CLICK_GAP = 0.5
+local ZONE_POINTS = {
+	Vector3.new(-1143.0, 121.0, -58.2),
+	Vector3.new(-1146.6, 121.0, -42.7),
+	Vector3.new(-1170.9, 121.0, -44.1),
+	Vector3.new(-1156.4, 121.0, -70.5),
+}
+local ZONE_INSET = 1.0           -- на сколько студов от края заходим внутрь зоны
+local ZONE_RELEASE_DELAY = 1.0   -- сколько секунд без целей нужно, чтобы снять ограничение
+local ZONE_RECOVER_SECONDS = 10  -- если HP выше ZONE_HP держится столько секунд подряд — выходим из зоны
+
+local FACE_SMOOTH = 20           -- плавность поворота к цели (больше = быстрее)
+
+local GLIDE_SMOOTH = 12          -- плавность разгона/смены направления (больше = резче)
+local GLIDE_K = 8                -- плавность торможения у цели (больше = тормозит позже)
+local GLIDE_MIN_SPEED = 2        -- минимальная скорость при подходе (студы/сек)
+
+local FARM_RADIUS = 500          -- радиус (студы), в котором ищем цели
+local CLICK_INTERVAL = 0.08      -- пауза между кликами (~12 кликов/сек)
+local SKIP_COOLDOWN = 2          -- не чаще чем раз в N сек нажимать Skip
+local EMPTY_DEBOUNCE = 0.5       -- цели должны отсутствовать N сек, прежде чем жать Skip
+
+local DEATH_KEYS_DURATION = 30   -- сколько секунд после смерти жать клавиши 2 -> 1
+local DEATH_KEYS_INTERVAL = 5    -- как часто (сек)
+local KEYS_GAP = 0.1             -- пауза между клавишей 2 и клавишей 1
+local DEATH_READY_DURATION = 10  -- сколько секунд после смерти жать Ready
+local DEATH_READY_INTERVAL = 1   -- как часто (сек)
+
+local FPS_RESET_BELOW = 15       -- сброс фарма, если FPS <= этого значения...
+local FPS_LOW_SECONDS = 20       -- ...держится столько секунд подряд
+local FARM_RESET_COOLDOWN = 20   -- не чаще чем раз в N секунд
+local FARM_RESET_PAUSE = 1       -- пауза во время сброса (сек): даёт игре "выдохнуть"
+
+------------------------------------------------------------
+-- Состояние
+------------------------------------------------------------
+local state = {
+	alive = true,        -- скрипт включён (false = полностью выключен)
+	running = false,     -- идёт ли к NPC
+	stopDist = 0.7,      -- зазор до цели (студы, от края до края)
+	glideSpeed = 15,     -- скорость скольжения (студы/сек), не зависит от WalkSpeed
+	autoJump = true,     -- прыгать, если застряли
+	retreat = true,      -- отступать при HP <= 50
+	zoneEnabled = true,  -- уходить в безопасную зону при HP <= 30
+	farm = false,        -- фарм
+	autoReset = true,    -- авто-сброс фарма при низком FPS
+	deathClick = true,   -- клик в выбранную точку после смерти
+	clickX = 0.5,        -- точка клика: доля ширины экрана (0..1)
+	clickY = 0.5,        -- точка клика: доля высоты экрана (0..1)
+	mode = "auto",       -- режим поиска («Авто (умный)» по умолчанию)
+	queries = { folder = "", name = "", tag = "" },
+}
+
+local connections = {}
+local function track(conn)
+	connections[#connections + 1] = conn
+	return conn
+end
+
+local function trim(s)
+	return (s:match("^%s*(.-)%s*$"))
+end
+
+------------------------------------------------------------
+-- Режимы поиска
+------------------------------------------------------------
+local MODES = {
+	{ id = "humanoid", label = "Humanoid", needsQuery = false },
+	{ id = "auto", label = "Авто (умный)", needsQuery = false },
+	{ id = "folder", label = "Папка", needsQuery = true, placeholder = "Путь: Mobs  или  Enemies.Zone1" },
+	{ id = "name", label = "Имя", needsQuery = true, placeholder = "Имя: Zombie, Boss (через запятую)" },
+	{ id = "tag", label = "Тег", needsQuery = true, placeholder = "Тег CollectionService: Enemy" },
+}
+local MODES_BY_ID = {}
+for _, m in ipairs(MODES) do
+	MODES_BY_ID[m.id] = m
+end
+
+local HP_NAMES = { "Health", "HP", "health", "hp" }
+
+------------------------------------------------------------
+-- Геометрия безопасной зоны (в плоскости XZ)
+------------------------------------------------------------
+local ZONE_CENTER = Vector3.zero
+do
+	local sx, sz = 0, 0
+	for _, p in ipairs(ZONE_POINTS) do
+		sx += p.X
+		sz += p.Z
+	end
+	ZONE_CENTER = Vector3.new(sx / #ZONE_POINTS, 0, sz / #ZONE_POINTS)
+end
+
+-- точка внутри многоугольника?
+local function pointInZone(p)
+	local inside = false
+	local j = #ZONE_POINTS
+	for i = 1, #ZONE_POINTS do
+		local a, b = ZONE_POINTS[i], ZONE_POINTS[j]
+		if (a.Z > p.Z) ~= (b.Z > p.Z) then
+			local xAt = (b.X - a.X) * (p.Z - a.Z) / (b.Z - a.Z) + a.X
+			if p.X < xAt then
+				inside = not inside
+			end
+		end
+		j = i
+	end
+	return inside
+end
+
+-- ближайшая точка на отрезке ab (XZ)
+local function closestOnSegment(p, a, b)
+	local abx, abz = b.X - a.X, b.Z - a.Z
+	local len2 = abx * abx + abz * abz
+	local t = 0
+	if len2 > 0 then
+		t = ((p.X - a.X) * abx + (p.Z - a.Z) * abz) / len2
+		t = math.clamp(t, 0, 1)
+	end
+	return Vector3.new(a.X + abx * t, 0, a.Z + abz * t)
+end
+
+-- куда идти, чтобы оказаться внутри зоны (ближайшая точка границы, чуть сдвинутая внутрь)
+local function zoneGoalPoint(p)
+	local best, bestD
+	for i = 1, #ZONE_POINTS do
+		local a = ZONE_POINTS[i]
+		local b = ZONE_POINTS[(i % #ZONE_POINTS) + 1]
+		local c = closestOnSegment(p, a, b)
+		local d = (Vector3.new(c.X, 0, c.Z) - Vector3.new(p.X, 0, p.Z)).Magnitude
+		if not bestD or d < bestD then
+			best, bestD = c, d
+		end
+	end
+	local toCenter = ZONE_CENTER - best
+	if toCenter.Magnitude > 0.01 then
+		best = best + toCenter.Unit * math.min(ZONE_INSET, toCenter.Magnitude)
+	end
+	return best
+end
+
+------------------------------------------------------------
+-- Вспомогательные функции для NPC
+------------------------------------------------------------
+local function isPlayerRelated(inst)
+	local cur = inst
+	while cur and cur ~= workspace do
+		if cur:IsA("Model") and Players:GetPlayerFromCharacter(cur) then
+			return true
+		end
+		cur = cur.Parent
+	end
+	return false
+end
+
+local function getRoot(model)
+	if model.PrimaryPart then
+		return model.PrimaryPart
+	end
+	for _, n in ipairs({ "HumanoidRootPart", "RootPart", "Torso", "UpperTorso", "Head" }) do
+		local p = model:FindFirstChild(n)
+		if p and p:IsA("BasePart") then
+			return p
+		end
+	end
+	return model:FindFirstChildWhichIsA("BasePart", true)
+end
+
+-- Жив ли NPC (Humanoid, либо атрибут/значение Health/HP, иначе считаем живым)
+local function isAlive(inst)
+	local hum = inst:FindFirstChildOfClass("Humanoid")
+	if hum then
+		return hum.Health > 0
+	end
+	for _, n in ipairs(HP_NAMES) do
+		local a = inst:GetAttribute(n)
+		if type(a) == "number" then
+			return a > 0
+		end
+		local v = inst:FindFirstChild(n)
+		if v and (v:IsA("NumberValue") or v:IsA("IntValue")) then
+			return v.Value > 0
+		end
+	end
+	return true
+end
+
+local function hasHpValue(inst)
+	for _, n in ipairs(HP_NAMES) do
+		if type(inst:GetAttribute(n)) == "number" then
+			return true
+		end
+		local v = inst:FindFirstChild(n)
+		if v and (v:IsA("NumberValue") or v:IsA("IntValue")) then
+			return true
+		end
+	end
+	return false
+end
+
+-- Горизонтальный "радиус" цели (по размерам модели) — нужен, чтобы считать расстояние от края
+local function calcRadius(inst, root)
+	local size = root.Size
+	if inst:IsA("Model") then
+		local ok, s = pcall(function() return inst:GetExtentsSize() end)
+		if ok and s then size = s end
+	elseif inst:IsA("BasePart") then
+		size = inst.Size
+	end
+	return (size.X + size.Z) / 4
+end
+
+local function makeCandidate(inst)
+	if not inst or not inst.Parent then return nil end
+	if isPlayerRelated(inst) then return nil end
+	local root
+	if inst:IsA("Model") then
+		root = getRoot(inst)
+	elseif inst:IsA("BasePart") then
+		root = inst
+	else
+		return nil
+	end
+	if not root then return nil end
+	if not isAlive(inst) then return nil end
+	return { inst = inst, root = root, name = inst.Name, radius = calcRadius(inst, root) }
+end
+
+------------------------------------------------------------
+-- Кандидаты (NPC) и их обновление
+------------------------------------------------------------
+local candidates = {}
+local candidatesReady = false  -- true, когда список целей уже собран для текущего режима
+local searchNote = nil
+local refreshId = 0
+local forceRefresh = false
+
+-- отслеживание Humanoid (быстрый режим)
+local npcHumanoids = {}
+local function addHumanoid(inst)
+	if inst:IsA("Humanoid") then
+		npcHumanoids[inst] = true
+	end
+end
+for _, inst in ipairs(workspace:GetDescendants()) do
+	addHumanoid(inst)
+end
+track(workspace.DescendantAdded:Connect(addHumanoid))
+track(workspace.DescendantRemoving:Connect(function(inst)
+	npcHumanoids[inst] = nil
+end))
+
+local function requestRefresh()
+	refreshId += 1
+	forceRefresh = true
+	candidates = {}
+	candidatesReady = false
+	searchNote = nil
+end
+
+-- Путь к папке: "Mobs", "workspace.Enemies.Zone1", "Enemies/Zone1"
+local function resolvePath(path)
+	local cur = workspace
+	for seg in path:gmatch("[^%.%/>]+") do
+		seg = trim(seg)
+		if seg ~= "" and not (cur == workspace and seg:lower() == "workspace") then
+			cur = cur:FindFirstChild(seg)
+			if not cur then
+				return nil
+			end
+		end
+	end
+	return cur
+end
+
+local function collectFromContainer(container, out, seen, depth)
+	if depth > 4 then return end
+	for _, child in ipairs(container:GetChildren()) do
+		if child:IsA("Model") or child:IsA("BasePart") then
+			if not seen[child] then
+				local c = makeCandidate(child)
+				if c then
+					seen[child] = true
+					out[#out + 1] = c
+				end
+			end
+		elseif child:IsA("Folder") then
+			collectFromContainer(child, out, seen, depth + 1)
+		end
+	end
+end
+
+-- Сканирование workspace с паузами, чтобы не фризить игру
+local function scanWorkspace(matchFn, id)
+	local out = {}
+	local n = 0
+	for _, inst in ipairs(workspace:GetDescendants()) do
+		n += 1
+		if n % 500 == 0 then
+			task.wait()
+			if id ~= refreshId or not state.alive then
+				return nil
+			end
+		end
+		if inst:IsA("Model") and matchFn(inst) then
+			local c = makeCandidate(inst)
+			if c then
+				out[#out + 1] = c
+			end
+		end
+	end
+	return out
+end
+
+local function refreshCandidates()
+	local id = refreshId
+	local mode = state.mode
+	local q = trim(state.queries[mode] or "")
+	local out, note = {}, nil
+
+	if mode == "humanoid" then
+		local seen = {}
+		for hum in pairs(npcHumanoids) do
+			local model = hum.Parent
+			if model and model:IsA("Model") and not seen[model] then
+				local c = makeCandidate(model)
+				if c then
+					seen[model] = true
+					out[#out + 1] = c
+				end
+			end
+		end
+
+	elseif mode == "auto" then
+		out = scanWorkspace(function(m)
+			return m:FindFirstChildOfClass("Humanoid") ~= nil
+				or m:FindFirstChildOfClass("AnimationController") ~= nil
+				or hasHpValue(m)
+		end, id)
+
+	elseif mode == "folder" then
+		if q == "" then
+			note = "Введите путь к папке"
+		else
+			local container = resolvePath(q)
+			if not container then
+				note = "Папка не найдена"
+			else
+				local seen = {}
+				collectFromContainer(container, out, seen, 0)
+				if #out == 0 and (container:IsA("Model") or container:IsA("BasePart")) then
+					local c = makeCandidate(container)
+					if c then out[1] = c end
+				end
+				if #out == 0 then
+					note = "В папке нет подходящих NPC"
+				end
+			end
+		end
+
+	elseif mode == "name" then
+		local names = {}
+		for part in q:gmatch("[^,]+") do
+			part = trim(part):lower()
+			if part ~= "" then
+				names[#names + 1] = part
+			end
+		end
+		if #names == 0 then
+			note = "Введите имя NPC"
+		else
+			out = scanWorkspace(function(m)
+				local nm = m.Name:lower()
+				for _, s in ipairs(names) do
+					if nm:find(s, 1, true) then
+						return true
+					end
+				end
+				return false
+			end, id)
+		end
+
+	elseif mode == "tag" then
+		if q == "" then
+			note = "Введите тег"
+		else
+			local seen = {}
+			for _, inst in ipairs(CollectionService:GetTagged(q)) do
+				if not seen[inst] and inst:IsDescendantOf(workspace) then
+					local c = makeCandidate(inst)
+					if c then
+						seen[inst] = true
+						out[#out + 1] = c
+					end
+				end
+			end
+			if #out == 0 then
+				note = "Объекты с таким тегом не найдены"
+			end
+		end
+	end
+
+	if out == nil or id ~= refreshId then
+		return -- поиск отменён (сменили режим/запрос)
+	end
+	candidates = out
+	searchNote = note
+	candidatesReady = true
+end
+
+task.spawn(function()
+	while state.alive do
+		refreshCandidates()
+		-- тяжёлые режимы (полный скан карты) обновляем реже
+		local interval = (state.mode == "auto" or state.mode == "name") and 3 or 1
+		local waited = 0
+		while waited < interval and not forceRefresh and state.alive do
+			waited += task.wait(0.1)
+		end
+		forceRefresh = false
+	end
+end)
+
+local function getMyRoot()
+	local char = player.Character
+	return char and char:FindFirstChild("HumanoidRootPart")
+end
+
+local function getMyHumanoid()
+	local char = player.Character
+	return char and char:FindFirstChildOfClass("Humanoid")
+end
+
+-- возвращает кандидата и расстояние между центрами (для выбора ближайшего)
+-- оптимизация: дорогая проверка isAlive выполняется только для тех, кто ближе текущего лучшего
+local function findNearest(fromPos)
+	local best, bestDist
+	for _, c in ipairs(candidates) do
+		local root = c.root
+		if c.inst.Parent and root.Parent then
+			local d = (root.Position - fromPos).Magnitude
+			if (not bestDist or d < bestDist) and isAlive(c.inst) then
+				best, bestDist = c, d
+			end
+		end
+	end
+	return best, bestDist
+end
+
+-- зазор между краями меня и цели (по горизонтали), в студах
+local function edgeGap(target, myRoot)
+	local o = target.root.Position - myRoot.Position
+	local flat = math.sqrt(o.X * o.X + o.Z * o.Z)
+	local myR = (myRoot.Size.X + myRoot.Size.Z) / 4
+	return math.max(0, flat - target.radius - myR)
+end
+
+------------------------------------------------------------
+-- Фарм: нажатие GUI-кнопок, клавиши, клики
+------------------------------------------------------------
+-- безопасный поиск по пути (без бесконечного WaitForChild)
+local function findPath(root, names)
+	local cur = root
+	for _, n in ipairs(names) do
+		cur = cur and cur:FindFirstChild(n)
+		if not cur then
+			return nil
+		end
+	end
+	return cur
+end
+
+-- имитация нажатия GUI-кнопки (firesignal + getconnections)
+local function fireButton(btn)
+	if not btn then return false end
+	local ok = pcall(function()
+		for _, sig in ipairs({ btn.MouseButton1Click, btn.Activated, btn.MouseButton1Down }) do
+			if firesignal then pcall(firesignal, sig) end
+			if getconnections then
+				for _, c in ipairs(getconnections(sig)) do
+					pcall(function() c:Fire() end)
+				end
+			end
+		end
+	end)
+	return ok
+end
+
+-- MainGui > Panels > Bossbar > SkipButton
+local function fireSkip()
+	return fireButton(findPath(player.PlayerGui, { "MainGui", "Panels", "Bossbar", "SkipButton" }))
+end
+
+-- HalloweenWaveHUD > Results > Bottom > Ready
+local function fireReady()
+	return fireButton(findPath(player.PlayerGui, { "HalloweenWaveHUD", "Results", "Bottom", "Ready" }))
+end
+
+local VIM = nil
+pcall(function()
+	VIM = game:GetService("VirtualInputManager")
+end)
+
+-- нажатие клавиши (keyCode — Enum.KeyCode, vk — код для keypress экзекутора)
+local function pressKey(keyCode, vk)
+	if VIM then
+		local ok = pcall(function()
+			VIM:SendKeyEvent(true, keyCode, false, game)
+			task.wait(0.03)
+			VIM:SendKeyEvent(false, keyCode, false, game)
+		end)
+		if ok then return end
+	end
+	if keypress and keyrelease then
+		pcall(function()
+			keypress(vk)
+			task.wait(0.03)
+			keyrelease(vk)
+		end)
+	end
+end
+
+-- клик в центр экрана
+local function clickCenter()
+	local camera = workspace.CurrentCamera
+	if not camera then return end
+	local vp = camera.ViewportSize
+	local x, y = vp.X / 2, vp.Y / 2
+
+	if VIM then
+		local ok = pcall(function()
+			VIM:SendMouseButtonEvent(x, y, 0, true, game, 0)
+			VIM:SendMouseButtonEvent(x, y, 0, false, game, 0)
+		end)
+		if ok then return end
+	end
+
+	-- запасные варианты
+	local char = player.Character
+	local tool = char and char:FindFirstChildOfClass("Tool")
+	if tool then
+		pcall(function() tool:Activate() end)
+	elseif mouse1click then
+		pcall(mouse1click)
+	end
+end
+
+-- один клик в произвольную точку экрана (координаты в пикселях)
+local function clickAt(x, y)
+	if VIM then
+		local ok = pcall(function()
+			VIM:SendMouseButtonEvent(x, y, 0, true, game, 0)
+			VIM:SendMouseButtonEvent(x, y, 0, false, game, 0)
+		end)
+		if ok then return end
+	end
+	-- запасной вариант для экзекуторов без VirtualInputManager
+	if mousemoveabs and mouse1click then
+		pcall(function()
+			mousemoveabs(x, y)
+			mouse1click()
+		end)
+	end
+end
+
+-- есть ли живые цели в радиусе FARM_RADIUS
+-- оптимизация: сначала дешёвая проверка расстояния, и только потом isAlive
+local function hasTargetsInRadius(rootPos)
+	for _, c in ipairs(candidates) do
+		local root = c.root
+		if c.inst.Parent and root.Parent
+			and (root.Position - rootPos).Magnitude <= FARM_RADIUS
+			and isAlive(c.inst) then
+			return true
+		end
+	end
+	return false
+end
+
+------------------------------------------------------------
+-- Фарм: действия после смерти
+------------------------------------------------------------
+local deathToken = 0
+local diedConn = nil
+
+local function onDeath()
+	if not state.alive or not state.farm then return end
+	deathToken += 1
+	local token = deathToken
+	local function active()
+		return state.alive and state.farm and token == deathToken
+	end
+
+	-- клик в выбранную точку: через DEATH_CLICK_DELAY сек, DEATH_CLICK_COUNT нажатий с паузой DEATH_CLICK_GAP
+	if state.deathClick then
+		task.spawn(function()
+			task.wait(DEATH_CLICK_DELAY)
+			for i = 1, DEATH_CLICK_COUNT do
+				if not active() then return end
+				local camera = workspace.CurrentCamera
+				if camera then
+					local vp = camera.ViewportSize
+					clickAt(state.clickX * vp.X, state.clickY * vp.Y)
+				end
+				if i < DEATH_CLICK_COUNT then
+					task.wait(DEATH_CLICK_GAP)
+				end
+			end
+		end)
+	end
+
+	-- кнопка Ready: раз в секунду, 10 секунд
+	task.spawn(function()
+		local count = math.floor(DEATH_READY_DURATION / DEATH_READY_INTERVAL)
+		for i = 1, count do
+			if not active() then return end
+			fireReady()
+			if i < count then
+				task.wait(DEATH_READY_INTERVAL)
+			end
+		end
+	end)
+
+	-- клавиши: 2 -> (почти сразу) 1, раз в 5 секунд, 30 секунд
+	task.spawn(function()
+		local cycles = math.floor(DEATH_KEYS_DURATION / DEATH_KEYS_INTERVAL)
+		for i = 1, cycles do
+			if not active() then return end
+			local cycleStart = os.clock()
+			pressKey(Enum.KeyCode.Two, 0x32)
+			task.wait(KEYS_GAP)
+			if not active() then return end
+			pressKey(Enum.KeyCode.One, 0x31)
+			if i < cycles then
+				local rest = DEATH_KEYS_INTERVAL - (os.clock() - cycleStart)
+				if rest > 0 then
+					task.wait(rest)
+				end
+			end
+		end
+	end)
+end
+
+local function hookCharacter(char)
+	if diedConn then
+		diedConn:Disconnect()
+		diedConn = nil
+	end
+	local hum = char:WaitForChild("Humanoid", 10)
+	if hum and state.alive then
+		diedConn = hum.Died:Connect(onDeath)
+	end
+end
+
+------------------------------------------------------------
+-- GUI
+------------------------------------------------------------
+local guiParent = playerGui
+do
+	local ok, hui = pcall(function() return gethui() end)
+	if ok and hui then guiParent = hui end
+end
+for _, p in ipairs({ playerGui, guiParent }) do
+	local old = p:FindFirstChild("NPCWalkerGUI")
+	if old then old:Destroy() end
+end
+
+local COLORS = {
+	bg = Color3.fromRGB(22, 22, 30),
+	card = Color3.fromRGB(34, 34, 46),
+	accent = Color3.fromRGB(99, 102, 241),
+	accent2 = Color3.fromRGB(139, 92, 246),
+	green = Color3.fromRGB(34, 197, 94),
+	orange = Color3.fromRGB(245, 158, 11),
+	red = Color3.fromRGB(239, 68, 68),
+	text = Color3.fromRGB(240, 240, 250),
+	subtext = Color3.fromRGB(160, 160, 185),
+	gray = Color3.fromRGB(58, 58, 74),
+}
+
+local cam = workspace.CurrentCamera
+local viewH = cam and cam.ViewportSize.Y or 600
+local FULL_H = math.clamp(viewH - 70, 220, 430)
+local MIN_H = 40
+
+local gui = Instance.new("ScreenGui")
+gui.Name = "NPCWalkerGUI"
+gui.ResetOnSpawn = false
+gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+gui.DisplayOrder = 999
+gui.Parent = guiParent
+
+local main = Instance.new("Frame")
+main.Name = "Main"
+main.Size = UDim2.fromOffset(280, FULL_H)
+main.Position = UDim2.new(0, 12, 0, 8)
+main.BackgroundColor3 = COLORS.bg
+main.BorderSizePixel = 0
+main.ClipsDescendants = true
+main.Parent = gui
+Instance.new("UICorner", main).CornerRadius = UDim.new(0, 16)
+do
+	local stroke = Instance.new("UIStroke", main)
+	stroke.Color = COLORS.accent
+	stroke.Thickness = 1.5
+	stroke.Transparency = 0.3
+end
+
+-- Заголовок (за него двигаем окно)
+local header = Instance.new("Frame")
+header.Name = "Header"
+header.Size = UDim2.new(1, 0, 0, 40)
+header.BackgroundColor3 = COLORS.accent
+header.BorderSizePixel = 0
+header.Parent = main
+do
+	local g = Instance.new("UIGradient", header)
+	g.Color = ColorSequence.new(COLORS.accent, COLORS.accent2)
+end
+
+local title = Instance.new("TextLabel")
+title.BackgroundTransparency = 1
+title.Size = UDim2.new(1, -118, 1, 0)
+title.Position = UDim2.fromOffset(14, 0)
+title.Font = Enum.Font.GothamBold
+title.TextSize = 16
+title.TextColor3 = Color3.new(1, 1, 1)
+title.TextXAlignment = Enum.TextXAlignment.Left
+title.TextTruncate = Enum.TextTruncate.AtEnd
+title.Text = "🧭 NPC Walker v12"
+title.Parent = header
+
+local fpsLabel = Instance.new("TextLabel")
+fpsLabel.BackgroundTransparency = 1
+fpsLabel.AnchorPoint = Vector2.new(1, 0.5)
+fpsLabel.Position = UDim2.new(1, -48, 0.5, 0)
+fpsLabel.Size = UDim2.fromOffset(64, 20)
+fpsLabel.Font = Enum.Font.GothamBold
+fpsLabel.TextSize = 13
+fpsLabel.TextColor3 = Color3.new(1, 1, 1)
+fpsLabel.TextXAlignment = Enum.TextXAlignment.Right
+fpsLabel.Text = "FPS --"
+fpsLabel.Parent = header
+
+-- Кнопка-помощник с анимацией нажатия
+-- bucket — таблица, куда складываются соединения кнопки (чтобы их можно было отключить при пересоздании)
+local function makeButton(parent, text, color, size, bucket)
+	local bag = bucket or connections
+	local btn = Instance.new("TextButton")
+	btn.AutoButtonColor = false
+	btn.Size = size
+	btn.BackgroundColor3 = color
+	btn.BorderSizePixel = 0
+	btn.Font = Enum.Font.GothamBold
+	btn.TextSize = 16
+	btn.TextColor3 = Color3.new(1, 1, 1)
+	btn.Text = text
+	btn.Parent = parent
+	Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 12)
+	local scale = Instance.new("UIScale", btn)
+	bag[#bag + 1] = btn.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.Touch
+			or input.UserInputType == Enum.UserInputType.MouseButton1 then
+			TweenService:Create(scale, TweenInfo.new(0.08), { Scale = 0.94 }):Play()
+		end
+	end)
+	bag[#bag + 1] = btn.InputEnded:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.Touch
+			or input.UserInputType == Enum.UserInputType.MouseButton1 then
+			TweenService:Create(scale, TweenInfo.new(0.12), { Scale = 1 }):Play()
+		end
+	end)
+	return btn
+end
+
+local minBtn = makeButton(header, "—", Color3.fromRGB(255, 255, 255), UDim2.fromOffset(34, 28))
+minBtn.AnchorPoint = Vector2.new(1, 0.5)
+minBtn.Position = UDim2.new(1, -8, 0.5, 0)
+minBtn.BackgroundTransparency = 0.8
+minBtn.TextSize = 18
+
+-- Тело меню (прокручивается — удобно на маленьких экранах)
+local body = Instance.new("ScrollingFrame")
+body.Name = "Body"
+body.BackgroundTransparency = 1
+body.BorderSizePixel = 0
+body.Position = UDim2.fromOffset(0, 40)
+body.Size = UDim2.new(1, 0, 1, -40)
+body.CanvasSize = UDim2.new(0, 0, 0, 0)
+body.AutomaticCanvasSize = Enum.AutomaticSize.Y
+body.ScrollBarThickness = 4
+body.ScrollBarImageColor3 = COLORS.accent
+body.ScrollingDirection = Enum.ScrollingDirection.Y
+body.Parent = main
+
+do
+	local pad = Instance.new("UIPadding", body)
+	pad.PaddingTop = UDim.new(0, 10)
+	pad.PaddingBottom = UDim.new(0, 10)
+	pad.PaddingLeft = UDim.new(0, 10)
+	pad.PaddingRight = UDim.new(0, 14)
+	local list = Instance.new("UIListLayout", body)
+	list.Padding = UDim.new(0, 8)
+	list.SortOrder = Enum.SortOrder.LayoutOrder
+end
+
+-- 1. Карточка статуса
+local statusCard = Instance.new("Frame")
+statusCard.LayoutOrder = 1
+statusCard.Size = UDim2.new(1, 0, 0, 62)
+statusCard.BackgroundColor3 = COLORS.card
+statusCard.BorderSizePixel = 0
+statusCard.Parent = body
+Instance.new("UICorner", statusCard).CornerRadius = UDim.new(0, 12)
+
+local statusLabel = Instance.new("TextLabel")
+statusLabel.BackgroundTransparency = 1
+statusLabel.Position = UDim2.fromOffset(12, 6)
+statusLabel.Size = UDim2.new(1, -24, 0, 24)
+statusLabel.Font = Enum.Font.GothamBold
+statusLabel.TextSize = 16
+statusLabel.TextXAlignment = Enum.TextXAlignment.Left
+statusLabel.TextColor3 = COLORS.subtext
+statusLabel.TextTruncate = Enum.TextTruncate.AtEnd
+statusLabel.Text = "⏸ Остановлено"
+statusLabel.Parent = statusCard
+
+local infoLabel = Instance.new("TextLabel")
+infoLabel.BackgroundTransparency = 1
+infoLabel.Position = UDim2.fromOffset(12, 32)
+infoLabel.Size = UDim2.new(1, -24, 0, 22)
+infoLabel.Font = Enum.Font.Gotham
+infoLabel.TextSize = 14
+infoLabel.TextXAlignment = Enum.TextXAlignment.Left
+infoLabel.TextTruncate = Enum.TextTruncate.AtEnd
+infoLabel.TextColor3 = COLORS.text
+infoLabel.Text = "🎯 Поиск NPC..."
+infoLabel.Parent = statusCard
+
+local lastStatus = nil
+local function setStatus(text, color)
+	if lastStatus == text then return end
+	lastStatus = text
+	statusLabel.Text = text
+	statusLabel.TextColor3 = color or COLORS.subtext
+end
+
+-- 2. Ряд Старт / Стоп
+local row1 = Instance.new("Frame")
+row1.LayoutOrder = 2
+row1.Size = UDim2.new(1, 0, 0, 48)
+row1.BackgroundTransparency = 1
+row1.Parent = body
+
+local startBtn = makeButton(row1, "▶  СТАРТ", COLORS.green, UDim2.new(0.5, -4, 1, 0))
+local stopBtn = makeButton(row1, "■  СТОП", COLORS.orange, UDim2.new(0.5, -4, 1, 0))
+stopBtn.AnchorPoint = Vector2.new(1, 0)
+stopBtn.Position = UDim2.new(1, 0, 0, 0)
+
+-- 3. Кнопка режима поиска
+local modeBtn = makeButton(body, "", COLORS.accent2, UDim2.new(1, 0, 0, 42))
+modeBtn.LayoutOrder = 3
+modeBtn.TextSize = 15
+
+-- 4. Поле ввода запроса (папка / имя / тег)
+local queryBox = Instance.new("TextBox")
+queryBox.LayoutOrder = 4
+queryBox.Size = UDim2.new(1, 0, 0, 40)
+queryBox.BackgroundColor3 = COLORS.card
+queryBox.BorderSizePixel = 0
+queryBox.Font = Enum.Font.Gotham
+queryBox.TextSize = 14
+queryBox.TextColor3 = COLORS.text
+queryBox.PlaceholderColor3 = COLORS.subtext
+queryBox.TextXAlignment = Enum.TextXAlignment.Left
+queryBox.ClearTextOnFocus = false
+queryBox.ClipsDescendants = true
+queryBox.Text = ""
+queryBox.Visible = false
+queryBox.Parent = body
+Instance.new("UICorner", queryBox).CornerRadius = UDim.new(0, 12)
+do
+	local qpad = Instance.new("UIPadding", queryBox)
+	qpad.PaddingLeft = UDim.new(0, 12)
+	qpad.PaddingRight = UDim.new(0, 12)
+	local qstroke = Instance.new("UIStroke", queryBox)
+	qstroke.Color = COLORS.accent
+	qstroke.Transparency = 0.5
+end
+
+-- Помощник: строка "подпись + кнопки − / +"
+local function makeStepperRow(order)
+	local row = Instance.new("Frame")
+	row.LayoutOrder = order
+	row.Size = UDim2.new(1, 0, 0, 40)
+	row.BackgroundTransparency = 1
+	row.Parent = body
+
+	local label = Instance.new("TextLabel")
+	label.BackgroundTransparency = 1
+	label.Size = UDim2.new(1, -96, 1, 0)
+	label.Font = Enum.Font.GothamMedium
+	label.TextSize = 14
+	label.TextXAlignment = Enum.TextXAlignment.Left
+	label.TextColor3 = COLORS.text
+	label.TextTruncate = Enum.TextTruncate.AtEnd
+	label.Parent = row
+
+	local plus = makeButton(row, "+", COLORS.gray, UDim2.fromOffset(44, 40))
+	plus.AnchorPoint = Vector2.new(1, 0)
+	plus.Position = UDim2.new(1, 0, 0, 0)
+	plus.TextSize = 22
+	local minus = makeButton(row, "−", COLORS.gray, UDim2.fromOffset(44, 40))
+	minus.AnchorPoint = Vector2.new(1, 0)
+	minus.Position = UDim2.new(1, -50, 0, 0)
+	minus.TextSize = 22
+	return label, plus, minus
+end
+
+-- 5. Дистанция до цели
+local distLabel, plusBtn, minusBtn = makeStepperRow(5)
+local function refreshDist()
+	distLabel.Text = ("📏 Зазор до цели: %.1f м"):format(state.stopDist)
+end
+refreshDist()
+
+-- изменение зазора: шаг 0.1 до 2 студов, дальше 0.5
+local function changeDist(dir)
+	local s = state.stopDist
+	local stepSize = ((dir > 0 and s >= 2) or (dir < 0 and s > 2)) and 0.5 or 0.1
+	s = s + dir * stepSize
+	s = math.floor(s * 10 + 0.5) / 10
+	state.stopDist = math.clamp(s, 0, 30)
+	refreshDist()
+end
+
+-- 6. Скорость скольжения
+local speedLabel, speedPlusBtn, speedMinusBtn = makeStepperRow(6)
+local function refreshSpeed()
+	speedLabel.Text = ("💨 Скольжение: %d ст/с"):format(state.glideSpeed)
+end
+refreshSpeed()
+
+local function changeSpeed(dir)
+	local s = state.glideSpeed
+	local stepSize = s >= 100 and 10 or 5
+	if dir < 0 and s <= 100 then stepSize = 5 end
+	state.glideSpeed = math.clamp(s + dir * stepSize, 5, 300)
+	refreshSpeed()
+end
+
+-- 7. Авто-прыжок при застревании
+local jumpBtn = makeButton(body, "", COLORS.gray, UDim2.new(1, 0, 0, 40))
+jumpBtn.LayoutOrder = 7
+jumpBtn.TextSize = 15
+local function refreshJumpBtn()
+	jumpBtn.Text = state.autoJump and "🦘 Прыжок при застревании: ВКЛ" or "🦘 Прыжок при застревании: ВЫКЛ"
+	TweenService:Create(jumpBtn, TweenInfo.new(0.15), {
+		BackgroundColor3 = state.autoJump and COLORS.accent or COLORS.gray,
+	}):Play()
+end
+refreshJumpBtn()
+
+-- 8. Отступление при HP <= 50
+local retreatBtn = makeButton(body, "", COLORS.gray, UDim2.new(1, 0, 0, 40))
+retreatBtn.LayoutOrder = 8
+retreatBtn.TextSize = 15
+local function refreshRetreatBtn()
+	retreatBtn.Text = state.retreat
+		and ("🏃 Отход при HP ≤ %d: ВКЛ"):format(RETREAT_HP)
+		or ("🏃 Отход при HP ≤ %d: ВЫКЛ"):format(RETREAT_HP)
+	TweenService:Create(retreatBtn, TweenInfo.new(0.15), {
+		BackgroundColor3 = state.retreat and COLORS.accent or COLORS.gray,
+	}):Play()
+end
+refreshRetreatBtn()
+
+-- 9. Безопасная зона при HP <= 30
+local zoneBtn = makeButton(body, "", COLORS.gray, UDim2.new(1, 0, 0, 40))
+zoneBtn.LayoutOrder = 9
+zoneBtn.TextSize = 15
+local function refreshZoneBtn()
+	zoneBtn.Text = state.zoneEnabled
+		and ("🛡 Зона при HP ≤ %d: ВКЛ"):format(ZONE_HP)
+		or ("🛡 Зона при HP ≤ %d: ВЫКЛ"):format(ZONE_HP)
+	TweenService:Create(zoneBtn, TweenInfo.new(0.15), {
+		BackgroundColor3 = state.zoneEnabled and COLORS.accent or COLORS.gray,
+	}):Play()
+end
+refreshZoneBtn()
+
+-- 10. (ФАРМ — кнопка создаётся ниже функцией buildFarmButton, её можно пересоздавать на ходу)
+
+-- 11. Клик после смерти (вкл/выкл)
+local deathClickBtn = makeButton(body, "", COLORS.gray, UDim2.new(1, 0, 0, 40))
+deathClickBtn.LayoutOrder = 11
+deathClickBtn.TextSize = 14
+local function refreshDeathClickBtn()
+	local text = ("🎯 Клик после смерти (+%d с): %s"):format(DEATH_CLICK_DELAY, state.deathClick and "ВКЛ" or "ВЫКЛ")
+	deathClickBtn.Text = text
+	TweenService:Create(deathClickBtn, TweenInfo.new(0.15), {
+		BackgroundColor3 = state.deathClick and COLORS.accent or COLORS.gray,
+	}):Play()
+end
+refreshDeathClickBtn()
+
+-- 12. Кнопка выбора точки клика (открывает панель со стрелками)
+local pointBtn = makeButton(body, "", COLORS.accent2, UDim2.new(1, 0, 0, 40))
+pointBtn.LayoutOrder = 12
+pointBtn.TextSize = 14
+
+-- 13. Панель со стрелками (скрыта, пока не нажата кнопка выше)
+local pointPanel = Instance.new("Frame")
+pointPanel.LayoutOrder = 13
+pointPanel.Size = UDim2.new(1, 0, 0, 128)
+pointPanel.BackgroundColor3 = COLORS.card
+pointPanel.BorderSizePixel = 0
+pointPanel.Visible = false
+pointPanel.Parent = body
+Instance.new("UICorner", pointPanel).CornerRadius = UDim.new(0, 12)
+
+local coordLabel = Instance.new("TextLabel")
+coordLabel.BackgroundTransparency = 1
+coordLabel.Position = UDim2.fromOffset(10, 6)
+coordLabel.Size = UDim2.new(1, -20, 0, 20)
+coordLabel.Font = Enum.Font.GothamMedium
+coordLabel.TextSize = 13
+coordLabel.TextXAlignment = Enum.TextXAlignment.Left
+coordLabel.TextColor3 = COLORS.text
+coordLabel.TextTruncate = Enum.TextTruncate.AtEnd
+coordLabel.Text = ""
+coordLabel.Parent = pointPanel
+
+-- маркер точки на экране (отдельный ScreenGui без отступа сверху, чтобы координаты совпадали с кликом)
+for _, p in ipairs({ playerGui, guiParent }) do
+	local oldMarker = p:FindFirstChild("NPCWalkerMarker")
+	if oldMarker then oldMarker:Destroy() end
+end
+local markerGui = Instance.new("ScreenGui")
+markerGui.Name = "NPCWalkerMarker"
+markerGui.ResetOnSpawn = false
+markerGui.IgnoreGuiInset = true
+markerGui.DisplayOrder = 1000
+markerGui.Parent = guiParent
+
+local marker = Instance.new("Frame")
+marker.AnchorPoint = Vector2.new(0.5, 0.5)
+marker.Size = UDim2.fromOffset(22, 22)
+marker.BackgroundColor3 = COLORS.red
+marker.BackgroundTransparency = 0.15
+marker.BorderSizePixel = 0
+marker.Visible = false
+marker.Parent = markerGui
+Instance.new("UICorner", marker).CornerRadius = UDim.new(1, 0)
+do
+	local ms = Instance.new("UIStroke", marker)
+	ms.Color = Color3.new(1, 1, 1)
+	ms.Thickness = 2
+end
+
+local POINT_STEPS = { 0.005, 0.01, 0.05 } -- 0.5% / 1% / 5% экрана
+local pointStepIndex = 2
+
+local stepBtn = makeButton(pointPanel, "", COLORS.gray, UDim2.fromOffset(90, 40))
+stepBtn.Position = UDim2.fromOffset(160, 50)
+stepBtn.TextSize = 13
+
+local function refreshPoint()
+	local camera = workspace.CurrentCamera
+	local vp = camera and camera.ViewportSize or Vector2.new(1280, 720)
+	coordLabel.Text = ("X %.1f%% • Y %.1f%%  (%d, %d px)"):format(
+		state.clickX * 100, state.clickY * 100,
+		math.floor(state.clickX * vp.X + 0.5), math.floor(state.clickY * vp.Y + 0.5)
+	)
+	marker.Position = UDim2.fromOffset(state.clickX * vp.X, state.clickY * vp.Y)
+	stepBtn.Text = ("Шаг %.1f%%"):format(POINT_STEPS[pointStepIndex] * 100)
+end
+
+local function movePoint(dx, dy)
+	local s = POINT_STEPS[pointStepIndex]
+	state.clickX = math.clamp(math.floor((state.clickX + dx * s) * 1000 + 0.5) / 1000, 0, 1)
+	state.clickY = math.clamp(math.floor((state.clickY + dy * s) * 1000 + 0.5) / 1000, 0, 1)
+	refreshPoint()
+end
+
+-- стрелки (крест): ▲ сверху, ◀ ▼ ▶ снизу
+local function makeArrow(text, x, y, dx, dy)
+	local b = makeButton(pointPanel, text, COLORS.gray, UDim2.fromOffset(44, 36))
+	b.Position = UDim2.fromOffset(x, y)
+	b.TextSize = 16
+	track(b.Activated:Connect(function()
+		movePoint(dx, dy)
+	end))
+	return b
+end
+makeArrow("▲", 58, 30, 0, -1)
+makeArrow("◀", 10, 72, -1, 0)
+makeArrow("▼", 58, 72, 0, 1)
+makeArrow("▶", 106, 72, 1, 0)
+
+track(stepBtn.Activated:Connect(function()
+	pointStepIndex = (pointStepIndex % #POINT_STEPS) + 1
+	refreshPoint()
+end))
+
+local function setPointPanel(open)
+	pointPanel.Visible = open
+	marker.Visible = open
+	pointBtn.Text = open and "📍 Точка клика: скрыть ▲" or "📍 Выбрать точку клика ▼"
+	if open then
+		refreshPoint()
+	end
+end
+setPointPanel(false)
+
+-- 14. Авто-сброс фарма при низком FPS
+local autoResetBtn = makeButton(body, "", COLORS.gray, UDim2.new(1, 0, 0, 40))
+autoResetBtn.LayoutOrder = 14
+autoResetBtn.TextSize = 13
+local function refreshAutoResetBtn()
+	autoResetBtn.Text = state.autoReset
+		and ("♻ Сброс при FPS ≤ %d (%d с): ВКЛ"):format(FPS_RESET_BELOW, FPS_LOW_SECONDS)
+		or ("♻ Сброс при FPS ≤ %d (%d с): ВЫКЛ"):format(FPS_RESET_BELOW, FPS_LOW_SECONDS)
+	TweenService:Create(autoResetBtn, TweenInfo.new(0.15), {
+		BackgroundColor3 = state.autoReset and COLORS.accent or COLORS.gray,
+	}):Play()
+end
+refreshAutoResetBtn()
+
+-- 12. Полное выключение
+local offBtn = makeButton(body, "⏻  ПОЛНОСТЬЮ ВЫКЛЮЧИТЬ", COLORS.red, UDim2.new(1, 0, 0, 46))
+offBtn.LayoutOrder = 15
+offBtn.TextSize = 15
+
+-- Применение режима поиска к интерфейсу
+local function applyMode()
+	local m = MODES_BY_ID[state.mode]
+	modeBtn.Text = ("🔎 Режим: %s  ›"):format(m.label)
+	queryBox.Visible = m.needsQuery
+	queryBox.PlaceholderText = m.placeholder or ""
+	queryBox.Text = state.queries[state.mode] or ""
+	requestRefresh()
+end
+
+------------------------------------------------------------
+-- ФАРМ: кнопка, циклы и авто-сброс
+------------------------------------------------------------
+local farmBtn = nil
+local farmConns = {}        -- соединения именно кнопки фарма (отключаются при пересоздании)
+local farmGen = 0           -- "поколение" циклов: старые циклы сами завершаются
+local farmResetting = false
+local resetCount = 0
+
+local function refreshFarmBtn()
+	if not farmBtn then return end
+	if farmResetting and state.farm then
+		farmBtn.Text = "♻ Сброс фарма..."
+		farmBtn.BackgroundColor3 = COLORS.orange
+		return
+	end
+	local suffix = (state.farm and resetCount > 0) and ("   ♻×" .. resetCount) or ""
+	farmBtn.Text = (state.farm and "🌾 ФАРМ: ВКЛ" or "🌾 ФАРМ: ВЫКЛ") .. suffix
+	TweenService:Create(farmBtn, TweenInfo.new(0.15), {
+		BackgroundColor3 = state.farm and COLORS.green or COLORS.gray,
+	}):Play()
+end
+
+local function flashFarm(text)
+	if farmBtn then
+		farmBtn.Text = text
+	end
+	task.delay(0.8, function()
+		if state.alive then refreshFarmBtn() end
+	end)
+end
+
+-- цикл авто-кликера (завершается сам, если фарм выключен или цикл устарел)
+local function clickLoop(gen)
+	while state.alive and state.farm and gen == farmGen do
+		clickCenter()
+		task.wait(CLICK_INTERVAL)
+	end
+end
+
+-- цикл авто-скипа (когда в радиусе нет целей)
+local function skipLoop(gen)
+	local emptySince = nil
+	local lastSkip = 0
+	while state.alive and state.farm and gen == farmGen do
+		-- работаем только когда список целей собран и поиск настроен корректно
+		if candidatesReady and not searchNote then
+			local root = getMyRoot()
+			if root then
+				if hasTargetsInRadius(root.Position) then
+					emptySince = nil
+				else
+					local now = os.clock()
+					emptySince = emptySince or now
+					if now - emptySince >= EMPTY_DEBOUNCE and now - lastSkip >= SKIP_COOLDOWN then
+						lastSkip = now
+						if fireSkip() then
+							flashFarm("⏭ Skip отправлен")
+						end
+					end
+				end
+			end
+		else
+			emptySince = nil
+		end
+		task.wait(0.3)
+	end
+end
+
+-- запуск циклов: каждый запуск увеличивает "поколение", поэтому дублей быть не может
+local function startFarmLoops()
+	farmGen += 1
+	local gen = farmGen
+	task.spawn(clickLoop, gen)
+	task.spawn(skipLoop, gen)
+end
+
+local function stopFarmLoops()
+	farmGen += 1
+end
+
+local function setFarm(on)
+	state.farm = on
+	if on then
+		startFarmLoops()
+	else
+		stopFarmLoops()
+		deathToken += 1 -- прерываем действия после смерти, если фарм выключили
+	end
+	refreshFarmBtn()
+end
+
+-- создание (и пересоздание) кнопки фарма
+local function destroyFarmButton()
+	for _, c in ipairs(farmConns) do
+		pcall(function() c:Disconnect() end)
+	end
+	table.clear(farmConns)
+	if farmBtn then
+		farmBtn:Destroy()
+		farmBtn = nil
+	end
+end
+
+local function buildFarmButton()
+	destroyFarmButton()
+	farmBtn = makeButton(body, "", COLORS.gray, UDim2.new(1, 0, 0, 44), farmConns)
+	farmBtn.LayoutOrder = 10
+	farmBtn.TextSize = 15
+	farmConns[#farmConns + 1] = farmBtn.Activated:Connect(function()
+		setFarm(not state.farm)
+	end)
+	refreshFarmBtn()
+end
+buildFarmButton()
+
+-- пересборка списка Humanoid с нуля (убирает возможный "мусор")
+local function rebuildHumanoidSet()
+	table.clear(npcHumanoids)
+	local n = 0
+	for _, inst in ipairs(workspace:GetDescendants()) do
+		n += 1
+		if n % 1000 == 0 then
+			task.wait()
+			if not state.alive then return end
+		end
+		addHumanoid(inst)
+	end
+end
+
+-- СБРОС ФАРМА: пересоздаём кнопку, циклы, списки целей, чистим память и продолжаем фарм
+local lastReset = 0
+local function resetFarm()
+	if farmResetting or not state.alive or not state.farm then return end
+	farmResetting = true
+	lastReset = os.clock()
+	task.spawn(function()
+		stopFarmLoops()                  -- останавливаем старые циклы (кликер и скип)
+		buildFarmButton()                -- пересоздаём кнопку фарма
+		requestRefresh()                 -- сбрасываем список целей
+		rebuildHumanoidSet()             -- пересобираем список Humanoid
+		pcall(collectgarbage, "collect") -- чистим память (где разрешено)
+		task.wait(FARM_RESET_PAUSE)      -- даём игре "выдохнуть"
+		resetCount += 1
+		farmResetting = false
+		if state.alive and state.farm then
+			startFarmLoops()             -- сразу продолжаем фарм
+		end
+		refreshFarmBtn()
+	end)
+end
+
+-- Монитор FPS: считаем кадры, раз в секунду проверяем порог.
+-- Сброс — только если FPS <= FPS_RESET_BELOW держится FPS_LOW_SECONDS секунд подряд.
+do
+	local frames, accum = 0, 0
+	local lowSeconds = 0
+	track(RunService.RenderStepped:Connect(function(dt)
+		frames += 1
+		accum += dt
+		if accum < 1 then return end
+		local fps = frames / accum
+		frames, accum = 0, 0
+
+		fpsLabel.Text = ("FPS %d"):format(math.floor(fps + 0.5))
+		fpsLabel.TextColor3 = fps <= FPS_RESET_BELOW and Color3.fromRGB(255, 200, 120) or Color3.new(1, 1, 1)
+
+		if state.farm and state.autoReset and not farmResetting then
+			if fps <= FPS_RESET_BELOW then
+				lowSeconds += 1
+			else
+				lowSeconds = 0
+			end
+			if lowSeconds >= FPS_LOW_SECONDS and os.clock() - lastReset >= FARM_RESET_COOLDOWN then
+				lowSeconds = 0
+				resetFarm()
+			end
+		else
+			lowSeconds = 0
+		end
+	end))
+end
+
+------------------------------------------------------------
+-- Скольжение (LinearVelocity в горизонтальной плоскости)
+------------------------------------------------------------
+local glideAttach = nil
+local glideLV = nil
+local glideVel = Vector3.zero   -- текущая (сглаженная) горизонтальная скорость
+
+local function destroyGlide()
+	if glideLV then
+		glideLV:Destroy()
+		glideLV = nil
+	end
+	if glideAttach then
+		glideAttach:Destroy()
+		glideAttach = nil
+	end
+end
+
+local function ensureGlide(root)
+	if glideLV and glideLV.Parent and glideAttach and glideAttach.Parent == root then
+		return
+	end
+	destroyGlide()
+	glideAttach = Instance.new("Attachment")
+	glideAttach.Name = "NPCWalkerAttachment"
+	glideAttach.Parent = root
+
+	glideLV = Instance.new("LinearVelocity")
+	glideLV.Name = "NPCWalkerGlide"
+	glideLV.Attachment0 = glideAttach
+	glideLV.RelativeTo = Enum.ActuatorRelativeTo.World
+	glideLV.VelocityConstraintMode = Enum.VelocityConstraintMode.Plane
+	glideLV.PrimaryTangentAxis = Vector3.new(1, 0, 0)
+	glideLV.SecondaryTangentAxis = Vector3.new(0, 0, 1)
+	glideLV.PlaneVelocity = Vector2.new(0, 0)
+	glideLV.MaxForce = math.huge
+	glideLV.Parent = root
+end
+
+local function stopGlide()
+	glideVel = Vector3.zero
+	destroyGlide()
+end
+
+-- desired — желаемая горизонтальная скорость (Vector3 с Y = 0)
+local function applyGlide(root, desired, dt)
+	local alpha = 1 - math.exp(-GLIDE_SMOOTH * dt)
+	glideVel = glideVel:Lerp(desired, alpha)
+
+	if desired.Magnitude < 0.01 and glideVel.Magnitude < 0.3 then
+		-- остановились: отпускаем персонажа
+		glideVel = Vector3.zero
+		if glideLV then
+			glideLV.Enabled = false
+		end
+		return
+	end
+
+	ensureGlide(root)
+	glideLV.Enabled = true
+	glideLV.PlaneVelocity = Vector2.new(glideVel.X, glideVel.Z)
+end
+
+-- плавный поворот персонажа лицом в направлении flat (горизонтальный вектор)
+local function faceDirection(root, flat, dt)
+	if flat.Magnitude < 0.1 then return end
+	local pos = root.Position
+	local goal = CFrame.lookAt(pos, pos + flat)
+	local alpha = 1 - math.exp(-FACE_SMOOTH * dt)
+	root.CFrame = root.CFrame:Lerp(goal, alpha)
+end
+
+------------------------------------------------------------
+-- Движение: плавное скольжение к цели, позиция цели читается каждый кадр
+------------------------------------------------------------
+local BIND_NAME = "NPCWalkerMove"
+local currentTarget = nil
+local lastRetarget = 0
+local stuckTime = 0
+local isBound = false
+local retreating = false
+
+-- безопасная зона
+local zoneActive = false     -- сейчас действует ограничение зоны
+local zoneArmed = true       -- можно ли включить зону (после снятия нужно, чтобы HP стало > ZONE_HP)
+local noTargetTime = 0       -- сколько секунд подряд нет целей (для снятия ограничения)
+local zoneRecoverTime = 0    -- сколько секунд подряд HP выше ZONE_HP в зоне (для выхода из зоны)
+local lastChar = nil         -- последний известный персонаж (чтобы заметить смерть/респавн)
+
+local function setAutoRotate(value)
+	local hum = getMyHumanoid()
+	if hum then
+		hum.AutoRotate = value
+	end
+end
+
+local function stopMoving()
+	local hum = getMyHumanoid()
+	if hum then
+		hum:Move(Vector3.zero, false)
+	end
+end
+
+local function unbindMove()
+	if isBound then
+		isBound = false
+		pcall(function() RunService:UnbindFromRenderStep(BIND_NAME) end)
+	end
+end
+
+local function targetValid(t)
+	return t ~= nil and t.inst.Parent ~= nil and t.root.Parent ~= nil and isAlive(t.inst)
+end
+
+-- прыжок, если застряли (скорость почти нулевая при условии cond)
+local function checkStuck(hum, root, dt, cond)
+	if state.autoJump and cond then
+		local v = root.AssemblyLinearVelocity
+		local speed = Vector3.new(v.X, 0, v.Z).Magnitude
+		if speed < 1.5 then
+			stuckTime += dt
+			if stuckTime > 0.35 then
+				hum.Jump = true
+				stuckTime = 0
+			end
+		else
+			stuckTime = 0
+		end
+	else
+		stuckTime = 0
+	end
+end
+
+local function resetLatches()
+	retreating = false
+	zoneActive = false
+	zoneArmed = true
+	noTargetTime = 0
+	zoneRecoverTime = 0
+end
+
+local function step(dt)
+	if not (state.alive and state.running) then return end
+
+	-- новый персонаж (смерть/респавн): сбрасываем зону и отход — в зону после смерти не идём
+	local char = player.Character
+	if char ~= lastChar then
+		lastChar = char
+		resetLatches()
+		glideVel = Vector3.zero
+	end
+
+	local hum, root = getMyHumanoid(), getMyRoot()
+	if not hum or not root or hum.Health <= 0 then
+		currentTarget = nil
+		resetLatches()
+		glideVel = Vector3.zero
+		setStatus("💤 Ждём персонажа...", COLORS.subtext)
+		return
+	end
+
+	-- поворотом занимаемся сами (чтобы всегда смотреть на цель)
+	if hum.AutoRotate then
+		hum.AutoRotate = false
+	end
+
+	local hp = hum.Health
+
+	-- пересчитываем ближайшего NPC несколько раз в секунду (или сразу, если цель пропала)
+	local now = os.clock()
+	if not targetValid(currentTarget) or now - lastRetarget > 0.15 then
+		currentTarget = findNearest(root.Position)
+		lastRetarget = now
+	end
+	local target = currentTarget
+
+	-- безопасная зона: включаем при HP <= ZONE_HP, снимаем когда пропали все цели
+	if state.zoneEnabled then
+		if zoneActive then
+			if not target and candidatesReady then
+				noTargetTime += dt
+				if noTargetTime >= ZONE_RELEASE_DELAY then
+					zoneActive = false
+					zoneArmed = false -- повторно включится только после того, как HP станет выше порога
+					noTargetTime = 0
+				end
+			else
+				noTargetTime = 0
+			end
+
+			-- отсчёт идёт ТОЛЬКО когда персонаж уже стоит в зоне и HP выше порога.
+			-- ZONE_RECOVER_SECONDS секунд подряд -> выходим из зоны и снова идём к цели;
+			-- если HP опять упадёт до ZONE_HP и ниже, зона включится заново
+			if zoneActive then
+				if hp > ZONE_HP and pointInZone(root.Position) then
+					zoneRecoverTime += dt
+					if zoneRecoverTime >= ZONE_RECOVER_SECONDS then
+						zoneActive = false
+						zoneArmed = true
+						zoneRecoverTime = 0
+						noTargetTime = 0
+					end
+				else
+					zoneRecoverTime = 0 -- HP низкий или персонаж ещё не в зоне: отсчёта нет
+				end
+			end
+		else
+			if hp > ZONE_HP then
+				zoneArmed = true
+			elseif zoneArmed and hp <= ZONE_HP then
+				zoneActive = true
+				noTargetTime = 0
+				zoneRecoverTime = 0
+			end
+		end
+	else
+		zoneActive = false
+	end
+
+	-- отступление: включаем при HP <= RETREAT_HP, выключаем когда HP стало выше
+	if state.retreat then
+		if not retreating and hp <= RETREAT_HP then
+			retreating = true
+		elseif retreating and hp > RETREAT_HP then
+			retreating = false
+		end
+	else
+		retreating = false
+	end
+
+	-- направление на цель (позиция NPC читается КАЖДЫЙ кадр) и поворот лицом к ней
+	local flat = nil
+	if target then
+		local offset = target.root.Position - root.Position
+		flat = Vector3.new(offset.X, 0, offset.Z)
+		faceDirection(root, flat, dt)
+	end
+
+	-- 1) Безопасная зона (высший приоритет)
+	if zoneActive then
+		local p = root.Position
+		local inside = pointInZone(p)
+		if inside then
+			hum:Move(Vector3.zero, false)
+			applyGlide(root, Vector3.zero, dt)
+			stuckTime = 0
+			local suffix = ""
+			if hp > ZONE_HP then
+				suffix = (" • выход через %d с"):format(math.ceil(ZONE_RECOVER_SECONDS - zoneRecoverTime))
+			end
+			setStatus(("🛡 В зоне (HP %d)%s"):format(math.floor(hp), suffix), COLORS.orange)
+		else
+			local goal = zoneGoalPoint(p)
+			local to = Vector3.new(goal.X - p.X, 0, goal.Z - p.Z)
+			local dist = to.Magnitude
+			if dist > 0.05 then
+				local dir = to.Unit
+				local speed = math.clamp(dist * GLIDE_K, GLIDE_MIN_SPEED, state.glideSpeed)
+				hum:Move(dir, false)
+				applyGlide(root, dir * speed, dt)
+			else
+				hum:Move(Vector3.zero, false)
+				applyGlide(root, Vector3.zero, dt)
+			end
+			setStatus(("🛡 Иду в зону (HP %d)"):format(math.floor(hp)), COLORS.orange)
+			checkStuck(hum, root, dt, true)
+		end
+		return
+	end
+
+	-- нет целей
+	if not target then
+		hum:Move(Vector3.zero, false)
+		applyGlide(root, Vector3.zero, dt)
+		stuckTime = 0
+		setStatus("🔍 " .. (searchNote or "NPC не найдены"), COLORS.orange)
+		return
+	end
+
+	-- 2) Отступление при HP <= 50: скользим в сторону, противоположную цели (но смотрим на неё)
+	if retreating then
+		local away = -flat
+		if away.Magnitude < 0.1 then
+			local look = root.CFrame.LookVector
+			away = -Vector3.new(look.X, 0, look.Z)
+		end
+		local dir = away.Unit
+		hum:Move(dir, false) -- только для анимации
+		applyGlide(root, dir * state.glideSpeed, dt)
+		setStatus(("🏃 Отступаю (HP %d)"):format(math.floor(hp)), COLORS.orange)
+		checkStuck(hum, root, dt, true)
+		return
+	end
+
+	-- 3) Обычное движение к цели
+	local gap = edgeGap(target, root)
+	local remaining = gap - state.stopDist
+
+	-- дошли до нужного зазора
+	if remaining <= 0.05 or flat.Magnitude < 0.1 then
+		hum:Move(Vector3.zero, false)
+		applyGlide(root, Vector3.zero, dt)
+		stuckTime = 0
+		setStatus("✅ Дошёл до: " .. target.name, COLORS.green)
+		return
+	end
+
+	-- скорость: максимум glideSpeed, плавное торможение при подходе
+	local dir = flat.Unit
+	local speed = math.clamp(remaining * GLIDE_K, GLIDE_MIN_SPEED, state.glideSpeed)
+	hum:Move(dir, false) -- только для анимации
+	applyGlide(root, dir * speed, dt)
+	setStatus("💨 Скольжу к: " .. target.name, COLORS.green)
+
+	-- застряли (упёрлись в препятствие) — прыгаем
+	checkStuck(hum, root, dt, gap > 3.5)
+end
+
+local function start()
+	if not state.alive or state.running then return end
+	-- забираем актуальный текст из поля ввода
+	if MODES_BY_ID[state.mode].needsQuery then
+		local newText = queryBox.Text
+		if newText ~= (state.queries[state.mode] or "") then
+			state.queries[state.mode] = newText
+			requestRefresh()
+		end
+	end
+	state.running = true
+	currentTarget = nil
+	stuckTime = 0
+	resetLatches()
+	glideVel = Vector3.zero
+	lastStatus = nil
+	setStatus("💨 Запуск...", COLORS.green)
+	unbindMove()
+	isBound = true
+	-- после обработки управления игрока, чтобы наш ввод не перебивался
+	RunService:BindToRenderStep(BIND_NAME, Enum.RenderPriority.Last.Value, step)
+end
+
+local function stop()
+	if not state.running then return end
+	state.running = false
+	unbindMove()
+	stopMoving()
+	stopGlide()
+	setAutoRotate(true)
+	currentTarget = nil
+	resetLatches()
+	setStatus("⏸ Остановлено", COLORS.subtext)
+end
+
+------------------------------------------------------------
+-- Полное выключение
+------------------------------------------------------------
+local function shutdown()
+	if not state.alive then return end
+	state.running = false
+	state.farm = false
+	unbindMove()
+	stopMoving()
+	stopGlide()
+	setAutoRotate(true)
+	stopFarmLoops()
+	refreshId += 1
+	deathToken += 1
+	state.alive = false
+	if diedConn then
+		diedConn:Disconnect()
+		diedConn = nil
+	end
+	for _, c in ipairs(farmConns) do
+		pcall(function() c:Disconnect() end)
+	end
+	table.clear(farmConns)
+	for _, c in ipairs(connections) do
+		pcall(function() c:Disconnect() end)
+	end
+	table.clear(connections)
+	table.clear(npcHumanoids)
+	candidates = {}
+	currentTarget = nil
+	markerGui:Destroy()
+	gui:Destroy()
+end
+
+------------------------------------------------------------
+-- События кнопок
+------------------------------------------------------------
+track(startBtn.Activated:Connect(start))
+track(stopBtn.Activated:Connect(stop))
+track(offBtn.Activated:Connect(shutdown))
+
+track(plusBtn.Activated:Connect(function()
+	changeDist(1)
+end))
+track(minusBtn.Activated:Connect(function()
+	changeDist(-1)
+end))
+track(speedPlusBtn.Activated:Connect(function()
+	changeSpeed(1)
+end))
+track(speedMinusBtn.Activated:Connect(function()
+	changeSpeed(-1)
+end))
+track(jumpBtn.Activated:Connect(function()
+	state.autoJump = not state.autoJump
+	refreshJumpBtn()
+end))
+track(retreatBtn.Activated:Connect(function()
+	state.retreat = not state.retreat
+	refreshRetreatBtn()
+end))
+track(zoneBtn.Activated:Connect(function()
+	state.zoneEnabled = not state.zoneEnabled
+	if not state.zoneEnabled then
+		zoneActive = false
+	end
+	refreshZoneBtn()
+end))
+track(deathClickBtn.Activated:Connect(function()
+	state.deathClick = not state.deathClick
+	refreshDeathClickBtn()
+end))
+track(pointBtn.Activated:Connect(function()
+	setPointPanel(not pointPanel.Visible)
+end))
+track(autoResetBtn.Activated:Connect(function()
+	state.autoReset = not state.autoReset
+	refreshAutoResetBtn()
+end))
+
+-- Смена режима по кругу
+track(modeBtn.Activated:Connect(function()
+	-- сохраняем введённый текст текущего режима
+	if MODES_BY_ID[state.mode].needsQuery then
+		state.queries[state.mode] = queryBox.Text
+	end
+	local idx = 1
+	for i, m in ipairs(MODES) do
+		if m.id == state.mode then
+			idx = i
+			break
+		end
+	end
+	state.mode = MODES[(idx % #MODES) + 1].id
+	applyMode()
+end))
+
+-- Ввод запроса
+track(queryBox:GetPropertyChangedSignal("Text"):Connect(function()
+	state.queries[state.mode] = queryBox.Text
+end))
+track(queryBox.FocusLost:Connect(function()
+	state.queries[state.mode] = queryBox.Text
+	requestRefresh()
+end))
+
+-- Сворачивание
+local minimized = false
+track(minBtn.Activated:Connect(function()
+	minimized = not minimized
+	minBtn.Text = minimized and "+" or "—"
+	TweenService:Create(main, TweenInfo.new(0.2, Enum.EasingStyle.Quad), {
+		Size = UDim2.fromOffset(280, minimized and MIN_H or FULL_H),
+	}):Play()
+end))
+
+-- Перетаскивание окна за заголовок (мышь и палец)
+do
+	local dragging, dragInput, dragStart, startPos
+	track(header.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.Touch
+			or input.UserInputType == Enum.UserInputType.MouseButton1 then
+			dragging = true
+			dragStart = input.Position
+			startPos = main.Position
+			input.Changed:Connect(function()
+				if input.UserInputState == Enum.UserInputState.End then
+					dragging = false
+				end
+			end)
+		end
+	end))
+	track(header.InputChanged:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseMovement
+			or input.UserInputType == Enum.UserInputType.Touch then
+			dragInput = input
+		end
+	end))
+	track(UserInputService.InputChanged:Connect(function(input)
+		if dragging and input == dragInput then
+			local d = input.Position - dragStart
+			main.Position = UDim2.new(
+				startPos.X.Scale, startPos.X.Offset + d.X,
+				startPos.Y.Scale, startPos.Y.Offset + d.Y
+			)
+		end
+	end))
+end
+
+------------------------------------------------------------
+-- Смерть персонажа: подключаем к текущему и каждому новому персонажу
+------------------------------------------------------------
+if player.Character then
+	task.spawn(hookCharacter, player.Character)
+end
+track(player.CharacterAdded:Connect(function(char)
+	glideVel = Vector3.zero
+	task.spawn(hookCharacter, char)
+end))
+
+------------------------------------------------------------
+-- Обновление информации о ближайшем NPC
+------------------------------------------------------------
+task.spawn(function()
+	while state.alive do
+		local root = getMyRoot()
+		if root then
+			local target = findNearest(root.Position)
+			if target then
+				infoLabel.Text = ("🎯 %s • зазор %.1f м  (найдено: %d)"):format(
+					target.name, edgeGap(target, root), #candidates
+				)
+			else
+				infoLabel.Text = "🎯 " .. (searchNote or "NPC не найдены")
+			end
+		end
+		task.wait(0.3)
+	end
+end)
+
+------------------------------------------------------------
+-- АВТОЗАПУСК: режим «Авто (умный)», ходьба к цели и фарм включаются сразу
+------------------------------------------------------------
+applyMode()
+start()
+setFarm(true)
