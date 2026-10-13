@@ -86,7 +86,7 @@ local FARM_RESET_PAUSE = 1       -- пауза во время сброса (с�
 local state = {
 	alive = true,        -- скрипт включён (false = полностью выключен)
 	running = false,     -- идёт ли к NPC
-	stopDist = 0.7,      -- зазор до цели (студы, от края до края)
+	stopDist = 0.6,      -- зазор до цели (студы, от края до края)
 	glideSpeed = 18,     -- скорость скольжения (студы/сек), не зависит от WalkSpeed
 	autoJump = true,     -- прыгать, если застряли
 	retreat = true,      -- отступать при HP <= 50
