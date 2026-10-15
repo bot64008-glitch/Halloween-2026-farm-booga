@@ -1,16 +1,18 @@
 --[[
-    WEB VALLEY STUDIO — NPC Walker v14
+    WEB VALLEY STUDIO — NPC Walker v15
 
-    Что нового в v14:
-      • Исправление «зависших» целей: труп без Humanoid, своя система HP, флаги смерти,
-        цель вне карты — теперь считаются мёртвыми. Плюс страж: цель, у которой HP не меняется
-        и которая не двигается, пока мы стоим рядом, временно пропускается.
-      • Клавиши 2 → 1 после смерти надёжнее: дольше удержание, ждём пока персонаж жив, повторы.
-      • Кнопка «ВИД СВЕРХУ» (ГЛАВНАЯ): камера на N студов выше и смотрит на игрока.
-      • Вкладка «ПРИОР.»: список замеченных целей (имена сохраняются), приоритет и уровень,
-        поиск/добавление по имени. Приоритетная цель выбирается даже если рядом есть другие.
-        Выше приоритета только отход и безопасная зона.
-      • Скорость меняется на 1, а любое число можно вписать вручную.
+    Что нового в v15 (защита от «призрачных» целей — несколько уровней):
+      1) События смерти: Humanoid.Died / HealthChanged / изменение HP-атрибутов / Destroying /
+         уход модели из workspace — цель считается мёртвой мгновенно.
+      2) Цель вне карты (NaN или ниже FallenPartsDestroyHeight).
+      3) Цель невидима: у модели нет видимых частей (все прозрачные).
+      4) Страж прогресса: зазор до цели не уменьшается N секунд — цель пропускается (недоступна).
+      5) Страж «у цели»: стоим рядом, а HP/позиция цели не меняются — пропуск
+         (если у цели нет данных о HP — ждём вдвое дольше).
+      6) Проверка анимаций (эксперимент, по умолчанию выключена).
+      • Диагностика: кнопки «Снимок цели» / «Последний бан» / «Копировать» (вкладка ДВИЖ.)
+        показывают подробные данные о цели и причину пропуска — их можно прислать для точной починки.
+    Остальное — как в v14 (приоритеты, вид сверху, ручной ввод чисел, сброс и т.д.).
 ]]
 
 local Players = game:GetService("Players")
@@ -43,6 +45,7 @@ local GLIDE_K = 8                -- плавность торможения у �
 local GLIDE_MIN_SPEED = 2        -- минимальная скорость при подходе (студы/сек)
 
 local GHOST_BAN_SECONDS = 30   -- на сколько секунд игнорируем «зависшую» цель
+local DEAD_MEMORY = 20         -- сколько секунд помним, что цель умерла (потом проверяем заново)
 local SKIP_COOLDOWN = 2          -- пауза между повторами Skip
 local EMPTY_DEBOUNCE = 0.5       -- цели должны отсутствовать N сек, чтобы считаться «пропавшими»
 
@@ -109,8 +112,13 @@ local state = {
 	-- камера и зависшие цели
 	topView = false,       -- вид сверху
 	topViewHeight = 20,    -- высота камеры над игроком
-	ghostFilter = true,    -- пропускать «зависшие» цели
-	ghostSeconds = 12,     -- сколько секунд цель без изменений рядом с нами считается зависшей
+	ghostFilter = true,    -- страж «у цели»: HP/позиция не меняются
+	ghostSeconds = 12,     -- сколько секунд ждать до пропуска цели (стражи прогресса и «у цели»)
+	deathEvents = true,    -- следить за событиями смерти цели
+	posCheck = true,       -- цель вне карты
+	visCheck = true,       -- цель невидима
+	progressCheck = true,  -- нет прогресса в приближении
+	animCheck = false,     -- нет анимаций (эксперимент)
 }
 
 local connections = {}
@@ -369,10 +377,15 @@ local function makeCandidate(inst)
 	}
 end
 
+-- метки смерти от событий: [inst] = os.clock() момента смерти (помним DEAD_MEMORY секунд)
+local deadSet = setmetatable({}, { __mode = "k" })
+
 -- цель жива и по-прежнему на карте (учитываем и пропавший Humanoid — «труп»)
 local function candAlive(c)
 	local inst = c.inst
 	if not inst.Parent or not c.root.Parent then return false end
+	local dsince = deadSet[inst]
+	if dsince and os.clock() - dsince < DEAD_MEMORY then return false end
 	local hum = c.hum
 	if hum and not hum:IsDescendantOf(inst) then return false end
 	return isAlive(inst)
@@ -1775,7 +1788,10 @@ local function checkStuck(hum, root, dt, cond)
 	end
 end
 
-local ghostTarget, ghostSince, ghostSig, ghostPos = nil, 0, nil, nil -- страж «зависших» целей
+local ghostTarget, ghostSince, ghostSig, ghostPos = nil, 0, nil, nil -- страж «у цели»
+local watchTarget = nil                -- цель, за которой следят стражи
+local progBestGap, progSince = nil, 0  -- страж прогресса приближения
+local visFailCount, animFailCount, lastGuardCheck = 0, 0, 0
 
 local function resetLatches()
 	ghostTarget = nil
@@ -1784,6 +1800,175 @@ local function resetLatches()
 	zoneArmed = true
 	noTargetTime = 0
 	zoneRecoverTime = 0
+end
+
+------------------------------------------------------------
+-- Защита от «призрачных» целей
+------------------------------------------------------------
+local hookConns = {}
+local hooked = setmetatable({}, { __mode = "k" })
+local banLog = {}
+
+-- события смерти для цели, за которой идём
+local function hookInst(inst, hum)
+	if hooked[inst] then return end
+	if #hookConns > 300 then
+		for _, c in ipairs(hookConns) do
+			pcall(function() c:Disconnect() end)
+		end
+		table.clear(hookConns)
+		table.clear(hooked)
+	end
+	hooked[inst] = true
+	local function add(conn)
+		hookConns[#hookConns + 1] = conn
+	end
+	add(inst.AncestryChanged:Connect(function()
+		if inst:IsDescendantOf(workspace) then
+			deadSet[inst] = nil -- вернулся на карту (пул) — снова живой
+		else
+			deadSet[inst] = os.clock()
+		end
+	end))
+	add(inst.Destroying:Connect(function()
+		deadSet[inst] = os.clock()
+	end))
+	if hum then
+		add(hum.Died:Connect(function()
+			deadSet[inst] = os.clock()
+		end))
+		add(hum.HealthChanged:Connect(function(h)
+			if h <= 0 then
+				deadSet[inst] = os.clock()
+			else
+				deadSet[inst] = nil
+			end
+		end))
+	end
+	for _, n in ipairs(HP_NAMES) do
+		add(inst:GetAttributeChangedSignal(n):Connect(function()
+			local a = inst:GetAttribute(n)
+			if type(a) == "number" then
+				deadSet[inst] = (a <= 0) and os.clock() or nil
+			end
+		end))
+	end
+end
+
+-- есть ли у модели хоть одна видимая часть
+local function hasVisibleParts(inst)
+	if inst:IsA("BasePart") then
+		return inst.Transparency < 0.95
+	end
+	for _, d in ipairs(inst:GetDescendants()) do
+		if d:IsA("BasePart") and d.Name ~= "HumanoidRootPart" and d.Transparency < 0.95 then
+			return true
+		end
+	end
+	return false
+end
+
+-- проигрываются ли анимации: true / false, nil — если Animator не найден
+local function animActive(inst)
+	local ok, res = pcall(function()
+		local animator = inst:FindFirstChildWhichIsA("Animator", true)
+		if not animator then return nil end
+		return #animator:GetPlayingAnimationTracks() > 0
+	end)
+	if ok then return res end
+	return nil
+end
+
+-- подробное описание цели (для диагностики)
+local function describeTarget(c)
+	local lines = {}
+	local function add(text)
+		lines[#lines + 1] = text
+	end
+	pcall(function()
+		local inst = c.inst
+		add(("Имя: %s (%s)"):format(inst.Name, inst.ClassName))
+		add("Путь: " .. inst:GetFullName())
+		add("В workspace: " .. tostring(inst:IsDescendantOf(workspace)))
+		local hum = inst:FindFirstChildOfClass("Humanoid")
+		if hum then
+			add(("Humanoid: HP %.1f / %.1f, состояние %s"):format(hum.Health, hum.MaxHealth, tostring(hum:GetState())))
+		else
+			add("Humanoid: нет" .. (c.hum and " (был при поиске!)" or ""))
+		end
+		add("HP-данные: " .. tostring(hpSignature(inst)))
+		local attrs = {}
+		for k, v in pairs(inst:GetAttributes()) do
+			attrs[#attrs + 1] = k .. "=" .. tostring(v)
+		end
+		add("Атрибуты: " .. (#attrs > 0 and table.concat(attrs, ", ") or "нет"))
+		local kids = {}
+		for i, ch in ipairs(inst:GetChildren()) do
+			if i > 25 then
+				kids[#kids + 1] = "..."
+				break
+			end
+			kids[#kids + 1] = ch.Name .. ":" .. ch.ClassName
+		end
+		add("Дети: " .. table.concat(kids, ", "))
+		local r = c.root
+		add(("Root: %s, поз %s, Anchored=%s"):format(r.Name, tostring(r.Position), tostring(r.Anchored)))
+		add("Видимые части: " .. tostring(hasVisibleParts(inst)))
+		add("Анимации идут: " .. tostring(animActive(inst)))
+		add(("candAlive=%s, isAlive=%s, deadSet=%s, banned=%s"):format(
+			tostring(candAlive(c)), tostring(isAlive(inst)), tostring(deadSet[inst] ~= nil), tostring(isBanned(c))
+		))
+	end)
+	return table.concat(lines, "\n")
+end
+
+-- временно пропускаем цель и записываем причину + снимок
+local function banTarget(target, reason)
+	blacklist[target.inst] = os.clock() + GHOST_BAN_SECONDS
+	table.insert(banLog, 1, { name = target.name, reason = reason, dump = describeTarget(target) })
+	if #banLog > 5 then
+		table.remove(banLog)
+	end
+	currentTarget = nil
+	ghostTarget = nil
+	watchTarget = nil
+	progBestGap = nil
+	setStatus(("Пропущена цель %s: %s"):format(target.name, reason), C.yellow)
+end
+
+-- быстрые проверки текущей цели; возвращает причину или nil
+local function guardTarget(target, now)
+	local inst, troot = target.inst, target.root
+	if state.posCheck then
+		local pos = troot.Position
+		if pos ~= pos or pos.Y < workspace.FallenPartsDestroyHeight + 10 then
+			return "позиция цели вне карты"
+		end
+	end
+	if now - lastGuardCheck >= 0.5 then
+		lastGuardCheck = now
+		if state.visCheck then
+			if hasVisibleParts(inst) then
+				visFailCount = 0
+			else
+				visFailCount += 1
+				if visFailCount >= 3 then
+					return "у цели нет видимых частей"
+				end
+			end
+		end
+		if state.animCheck then
+			if animActive(inst) == false then
+				animFailCount += 1
+				if animFailCount >= 6 then
+					return "нет проигрываемых анимаций (3 с)"
+				end
+			else
+				animFailCount = 0
+			end
+		end
+	end
+	return nil
 end
 
 local function step(dt)
@@ -1822,6 +2007,23 @@ local function step(dt)
 		lastRetarget = now
 	end
 	local target = currentTarget
+
+	-- слежение за целью: подписка на события смерти и проверки «призрака»
+	if target then
+		if target ~= watchTarget then
+			watchTarget = target
+			progBestGap, progSince, visFailCount, animFailCount = nil, now, 0, 0
+			ghostTarget = nil
+			if state.deathEvents then
+				hookInst(target.inst, target.hum)
+			end
+		end
+		local reason = guardTarget(target, now)
+		if reason then
+			banTarget(target, reason)
+			target = nil
+		end
+	end
 
 	-- безопасная зона: включаем при HP <= zoneHp, снимаем когда пропали все цели
 	-- или когда HP выше порога держится zoneRecover секунд ПОДРЯД, пока персонаж стоит в зоне
@@ -1887,6 +2089,7 @@ local function step(dt)
 
 	-- 1) Безопасная зона (высший приоритет)
 	if zoneActive then
+		progBestGap = nil
 		local p = root.Position
 		if pointInZone(p) then
 			hum:Move(Vector3.zero, false)
@@ -1927,6 +2130,7 @@ local function step(dt)
 
 	-- 2) Отход от цели при низком HP (смотрим на цель, пятимся)
 	if retreating then
+		progBestGap = nil
 		local away = -flat
 		if away.Magnitude < 0.1 then
 			local look = root.CFrame.LookVector
@@ -1948,9 +2152,10 @@ local function step(dt)
 		hum:Move(Vector3.zero, false)
 		applyGlide(root, Vector3.zero, dt)
 		stuckTime = 0
+		progBestGap = nil
 		setStatus("У цели: " .. target.name, C.text)
 
-		-- страж: мы стоим у цели, а её HP не меняется и она не двигается -> цель «зависла»
+		-- страж «у цели»: HP не меняется и цель не двигается -> «призрак»
 		if state.ghostFilter then
 			local sig = hpSignature(target.inst)
 			local tpos = target.root.Position
@@ -1960,11 +2165,11 @@ local function step(dt)
 				if sig ~= ghostSig or (tpos - ghostPos).Magnitude > 0.5 then
 					ghostSince, ghostSig, ghostPos = now, sig, tpos
 				end
-				if sig ~= nil and now - ghostSince >= state.ghostSeconds then
-					blacklist[target.inst] = now + GHOST_BAN_SECONDS
-					ghostTarget = nil
-					currentTarget = nil
-					setStatus("Пропущена зависшая цель: " .. target.name, C.yellow)
+				-- если у цели нет данных о HP — ждём вдвое дольше
+				local limit = (sig ~= nil) and state.ghostSeconds or state.ghostSeconds * 2
+				if now - ghostSince >= limit then
+					banTarget(target, ("стоим у цели %d с, она не меняется"):format(limit))
+					return
 				end
 			end
 		end
@@ -1972,6 +2177,17 @@ local function step(dt)
 	end
 
 	ghostTarget = nil
+
+	-- страж прогресса: зазор должен уменьшаться, иначе цель недоступна / «призрак»
+	if state.progressCheck then
+		if progBestGap == nil or gap < progBestGap - 1.0 then
+			progBestGap, progSince = gap, now
+		elseif now - progSince >= state.ghostSeconds then
+			banTarget(target, ("нет прогресса в приближении %d с (зазор %.1f)"):format(state.ghostSeconds, gap))
+			return
+		end
+	end
+
 	local dir = flat.Unit
 	local speed = approachSpeed(remaining)
 	hum:Move(dir, false)
@@ -2122,6 +2338,10 @@ local function shutdown()
 	table.clear(npcHumanoids)
 	candidates = {}
 	currentTarget = nil
+	for _, c in ipairs(hookConns) do
+		pcall(function() c:Disconnect() end)
+	end
+	table.clear(hookConns)
 	markerGui:Destroy()
 	gui:Destroy()
 end
@@ -2256,14 +2476,6 @@ do
 	addToggle(p, "Прыжок при застревании", function() return state.autoJump end, function(v)
 		state.autoJump = v
 	end)
-	addToggle(p, "Пропуск зависших целей", function() return state.ghostFilter end, function(v)
-		state.ghostFilter = v
-	end)
-	addNumber(p, "Зависание цели, с", {
-		get = function() return state.ghostSeconds end,
-		set = function(v) state.ghostSeconds = v end,
-		step = 1, min = 3, max = 120, dec = 0,
-	})
 
 	addSection(p, "КАМЕРА")
 	addNumber(p, "Высота камеры", {
@@ -2272,6 +2484,122 @@ do
 		step = 1, min = 5, max = 300, dec = 0,
 	})
 	addNote(p, "Кнопка «ВИД СВЕРХУ» находится на вкладке ГЛАВНАЯ.", 28)
+
+	addSection(p, "ЗАЩИТА ОТ «ПРИЗРАКОВ»")
+	addToggle(p, "События смерти цели", function() return state.deathEvents end, function(v)
+		state.deathEvents = v
+	end)
+	addToggle(p, "Цель вне карты", function() return state.posCheck end, function(v)
+		state.posCheck = v
+	end)
+	addToggle(p, "Цель невидима", function() return state.visCheck end, function(v)
+		state.visCheck = v
+	end)
+	addToggle(p, "Нет прогресса к цели", function() return state.progressCheck end, function(v)
+		state.progressCheck = v
+	end)
+	addToggle(p, "Цель не меняется рядом", function() return state.ghostFilter end, function(v)
+		state.ghostFilter = v
+	end)
+	addToggle(p, "Нет анимаций (эксперимент)", function() return state.animCheck end, function(v)
+		state.animCheck = v
+	end)
+	addNumber(p, "Ожидание стража, с", {
+		get = function() return state.ghostSeconds end,
+		set = function(v) state.ghostSeconds = v end,
+		step = 1, min = 3, max = 120, dec = 0,
+	})
+
+	addSection(p, "ДИАГНОСТИКА ЦЕЛИ")
+	local diagLabel = Instance.new("TextLabel")
+	diagLabel.BackgroundColor3 = C.card
+	diagLabel.BorderSizePixel = 0
+	diagLabel.Size = UDim2.new(1, 0, 0, 0)
+	diagLabel.AutomaticSize = Enum.AutomaticSize.Y
+	diagLabel.Font = Enum.Font.Code
+	diagLabel.TextSize = 10
+	diagLabel.TextColor3 = C.text
+	diagLabel.TextXAlignment = Enum.TextXAlignment.Left
+	diagLabel.TextYAlignment = Enum.TextYAlignment.Top
+	diagLabel.TextWrapped = true
+	diagLabel.Text = "Когда скрипт идёт к «призраку», нажми «Снимок цели», затем «Копировать» и пришли текст. «Последний бан» показывает причину последнего автопропуска."
+	diagLabel.LayoutOrder = nextOrder(p)
+	diagLabel.Parent = p.frame
+	Instance.new("UICorner", diagLabel).CornerRadius = UDim.new(0, 8)
+	do
+		local dpad = Instance.new("UIPadding", diagLabel)
+		dpad.PaddingTop = UDim.new(0, 6)
+		dpad.PaddingBottom = UDim.new(0, 6)
+		dpad.PaddingLeft = UDim.new(0, 8)
+		dpad.PaddingRight = UDim.new(0, 8)
+	end
+	local diagText = diagLabel.Text
+
+	local function showDiag(text)
+		diagText = text
+		diagLabel.Text = text
+	end
+
+	local function copyText(text)
+		if setclipboard then
+			pcall(setclipboard, text)
+			return true
+		end
+		if toclipboard then
+			pcall(toclipboard, text)
+			return true
+		end
+		if writefile then
+			pcall(writefile, "WebValley_diag.txt", text)
+			return true
+		end
+		return false
+	end
+
+	local drow = Instance.new("Frame")
+	drow.Size = UDim2.new(1, 0, 0, 30)
+	drow.BackgroundTransparency = 1
+	drow.LayoutOrder = nextOrder(p)
+	drow.Parent = p.frame
+
+	local snapBtn = makeButton(drow, "Снимок цели", C.btn, C.text, UDim2.new(1 / 3, -4, 1, 0))
+	snapBtn.TextSize = 11
+	local banBtn = makeButton(drow, "Последний бан", C.btn, C.text, UDim2.new(1 / 3, -4, 1, 0))
+	banBtn.Position = UDim2.new(1 / 3, 2, 0, 0)
+	banBtn.TextSize = 11
+	local copyBtn = makeButton(drow, "Копировать", C.yellow, C.black, UDim2.new(1 / 3, -4, 1, 0))
+	copyBtn.Position = UDim2.new(2 / 3, 4, 0, 0)
+	copyBtn.TextSize = 11
+
+	track(snapBtn.Activated:Connect(function()
+		local target = currentTarget
+		if not target then
+			local root = getMyRoot()
+			if root then
+				target = findNearest(root.Position)
+			end
+		end
+		if target then
+			showDiag("СНИМОК ЦЕЛИ\n" .. describeTarget(target))
+		else
+			showDiag("Цели сейчас нет.")
+		end
+	end))
+	track(banBtn.Activated:Connect(function()
+		local entry = banLog[1]
+		if entry then
+			showDiag(("ПОСЛЕДНИЙ БАН: %s\nПричина: %s\n%s"):format(entry.name, entry.reason, entry.dump))
+		else
+			showDiag("Автопропусков пока не было.")
+		end
+	end))
+	track(copyBtn.Activated:Connect(function()
+		local ok = copyText(diagText)
+		copyBtn.Text = ok and "Скопировано" or "Недоступно"
+		task.delay(1.2, function()
+			copyBtn.Text = "Копировать"
+		end)
+	end))
 
 	addSection(p, "ЗДОРОВЬЕ")
 	addToggle(p, "Отход при низком HP", function() return state.retreat end, function(v)
