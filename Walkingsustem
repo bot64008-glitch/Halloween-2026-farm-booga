@@ -1,18 +1,16 @@
 --[[
-    WEB VALLEY STUDIO — NPC Walker v13
+    WEB VALLEY STUDIO — NPC Walker v14
 
-    Что нового в v13:
-      • Новое минималистичное меню (чёрный / серый / белый / жёлтый) с логотипом (ID 128430833466493).
-        Вкладки: ГЛАВНАЯ · ДВИЖЕНИЕ · ФАРМ · СБРОС. Кнопка «—» сворачивает меню в иконку.
-      • Режим СБРОСА: каждые N пропаданий всех целей — цикл из двух ресетов персонажа
-        (первый сразу, второй через 6.5 сек; N и паузу можно менять).
-      • Гибкие настройки: почти всё включается/выключается отдельно
-        (постоянные клики, скип, повтор скипа, действия после смерти, поворот к цели и т.д.).
-
-    Работает как раньше: скольжение к ближайшей цели, безопасная зона, отход при низком HP,
-    фарм (клики, скип Bossbar, действия после смерти), авто-сброс фарма при низком FPS, автозапуск.
-
-    Куда вставлять: LocalScript в StarterPlayer > StarterPlayerScripts (или запуск через экзекутор)
+    Что нового в v14:
+      • Исправление «зависших» целей: труп без Humanoid, своя система HP, флаги смерти,
+        цель вне карты — теперь считаются мёртвыми. Плюс страж: цель, у которой HP не меняется
+        и которая не двигается, пока мы стоим рядом, временно пропускается.
+      • Клавиши 2 → 1 после смерти надёжнее: дольше удержание, ждём пока персонаж жив, повторы.
+      • Кнопка «ВИД СВЕРХУ» (ГЛАВНАЯ): камера на N студов выше и смотрит на игрока.
+      • Вкладка «ПРИОР.»: список замеченных целей (имена сохраняются), приоритет и уровень,
+        поиск/добавление по имени. Приоритетная цель выбирается даже если рядом есть другие.
+        Выше приоритета только отход и безопасная зона.
+      • Скорость меняется на 1, а любое число можно вписать вручную.
 ]]
 
 local Players = game:GetService("Players")
@@ -44,6 +42,7 @@ local GLIDE_SMOOTH = 12          -- плавность разгона/смены
 local GLIDE_K = 8                -- плавность торможения у цели
 local GLIDE_MIN_SPEED = 2        -- минимальная скорость при подходе (студы/сек)
 
+local GHOST_BAN_SECONDS = 30   -- на сколько секунд игнорируем «зависшую» цель
 local SKIP_COOLDOWN = 2          -- пауза между повторами Skip
 local EMPTY_DEBOUNCE = 0.5       -- цели должны отсутствовать N сек, чтобы считаться «пропавшими»
 
@@ -101,6 +100,17 @@ local state = {
 	resetEvery = 5,        -- каждые N пропаданий всех целей
 	resetDelay = 6.5,      -- пауза между первым и вторым ресетом (сек)
 	autoReset = true,      -- пересоздание кнопки фарма при низком FPS
+
+	-- приоритет целей
+	priorityEnabled = true,
+	priorities = {},       -- ключ (имя в нижнем регистре) -> уровень приоритета (1..99)
+	newPriorityLevel = 1,  -- уровень для новых приоритетных целей
+
+	-- камера и зависшие цели
+	topView = false,       -- вид сверху
+	topViewHeight = 20,    -- высота камеры над игроком
+	ghostFilter = true,    -- пропускать «зависшие» цели
+	ghostSeconds = 12,     -- сколько секунд цель без изменений рядом с нами считается зависшей
 }
 
 local connections = {}
@@ -112,6 +122,61 @@ end
 local function trim(s)
 	return (s:match("^%s*(.-)%s*$"))
 end
+
+local HttpService = game:GetService("HttpService")
+
+------------------------------------------------------------
+-- Приоритеты и «замеченные» цели (сохраняются в файл, если экзекутор поддерживает writefile)
+------------------------------------------------------------
+local SAVE_FILE = "WebValley_NPCWalker.json"
+local seenNames = {}              -- ключ (имя в нижнем регистре) -> имя для показа
+local presentNow = {}             -- ключи целей, которые сейчас в радиусе
+local saveQueued = false
+local refreshPriorityList = nil   -- назначается позже (обновляет список на вкладке ПРИОР.)
+local onCandidatesUpdated = nil   -- назначается позже (запоминает замеченные цели)
+
+local function saveData()
+	if not writefile then return end
+	pcall(function()
+		writefile(SAVE_FILE, HttpService:JSONEncode({ priorities = state.priorities, seen = seenNames }))
+	end)
+end
+
+local function queueSave()
+	if saveQueued then return end
+	saveQueued = true
+	task.delay(1.5, function()
+		saveQueued = false
+		saveData()
+	end)
+end
+
+local function loadData()
+	if not (readfile and isfile) then return end
+	local ok, raw = pcall(function()
+		if isfile(SAVE_FILE) then
+			return readfile(SAVE_FILE)
+		end
+	end)
+	if not ok or not raw then return end
+	local ok2, data = pcall(function() return HttpService:JSONDecode(raw) end)
+	if not ok2 or type(data) ~= "table" then return end
+	if type(data.priorities) == "table" then
+		for k, v in pairs(data.priorities) do
+			if type(k) == "string" and type(v) == "number" then
+				state.priorities[k] = v
+			end
+		end
+	end
+	if type(data.seen) == "table" then
+		for k, v in pairs(data.seen) do
+			if type(k) == "string" and type(v) == "string" then
+				seenNames[k] = v
+			end
+		end
+	end
+end
+loadData()
 
 ------------------------------------------------------------
 -- Режимы поиска
@@ -216,11 +281,23 @@ local function getRoot(model)
 	return model:FindFirstChildWhichIsA("BasePart", true)
 end
 
--- Жив ли NPC (Humanoid, либо атрибут/значение Health/HP, иначе считаем живым)
+-- признаки смерти, которые игры ставят на модель
+local DEAD_FLAGS = { "Dead", "IsDead", "Died", "dead", "isDead" }
+
+-- Жив ли NPC: учитываем и Humanoid, и собственную систему HP (атрибуты/значения), и флаги смерти
 local function isAlive(inst)
+	if not inst:IsDescendantOf(workspace) then
+		return false
+	end
 	local hum = inst:FindFirstChildOfClass("Humanoid")
 	if hum then
-		return hum.Health > 0
+		if hum.Health <= 0 then return false end
+		if hum:GetState() == Enum.HumanoidStateType.Dead then return false end
+	end
+	for _, n in ipairs(DEAD_FLAGS) do
+		if inst:GetAttribute(n) == true then
+			return false
+		end
 	end
 	for _, n in ipairs(HP_NAMES) do
 		local a = inst:GetAttribute(n)
@@ -233,6 +310,19 @@ local function isAlive(inst)
 		end
 	end
 	return true
+end
+
+-- «подпись» здоровья цели: число (Humanoid.Health / HP) или nil, если данных нет
+local function hpSignature(inst)
+	local hum = inst:FindFirstChildOfClass("Humanoid")
+	if hum then return hum.Health end
+	for _, n in ipairs(HP_NAMES) do
+		local a = inst:GetAttribute(n)
+		if type(a) == "number" then return a end
+		local v = inst:FindFirstChild(n)
+		if v and (v:IsA("NumberValue") or v:IsA("IntValue")) then return v.Value end
+	end
+	return nil
 end
 
 local function hasHpValue(inst)
@@ -273,7 +363,26 @@ local function makeCandidate(inst)
 	end
 	if not root then return nil end
 	if not isAlive(inst) then return nil end
-	return { inst = inst, root = root, name = inst.Name, radius = calcRadius(inst, root) }
+	return {
+		inst = inst, root = root, name = inst.Name, key = inst.Name:lower(),
+		hum = inst:FindFirstChildOfClass("Humanoid"), radius = calcRadius(inst, root),
+	}
+end
+
+-- цель жива и по-прежнему на карте (учитываем и пропавший Humanoid — «труп»)
+local function candAlive(c)
+	local inst = c.inst
+	if not inst.Parent or not c.root.Parent then return false end
+	local hum = c.hum
+	if hum and not hum:IsDescendantOf(inst) then return false end
+	return isAlive(inst)
+end
+
+-- временно игнорируемые («зависшие») цели: [inst] = os.clock() до которого игнорируем
+local blacklist = setmetatable({}, { __mode = "k" })
+local function isBanned(c)
+	local ban = blacklist[c.inst]
+	return ban ~= nil and ban > os.clock()
 end
 
 ------------------------------------------------------------
@@ -454,6 +563,7 @@ local function refreshCandidates()
 	candidates = out
 	searchNote = note
 	candidatesReady = true
+	if onCandidatesUpdated then onCandidatesUpdated() end
 end
 
 task.spawn(function()
@@ -478,15 +588,46 @@ local function getMyHumanoid()
 	return char and char:FindFirstChildOfClass("Humanoid")
 end
 
--- ближайшая цель (дорогая проверка isAlive — только для тех, кто ближе текущего лучшего)
+-- запоминаем имена целей, замеченных в радиусе (для вкладки ПРИОР.)
+onCandidatesUpdated = function()
+	local root = getMyRoot()
+	if not root then return end
+	local pos = root.Position
+	local radius = state.farmRadius
+	local present = {}
+	local changed = false
+	for _, c in ipairs(candidates) do
+		if (c.root.Position - pos).Magnitude <= radius then
+			present[c.key] = true
+			if not seenNames[c.key] then
+				seenNames[c.key] = c.name
+				changed = true
+			end
+		end
+	end
+	presentNow = present
+	if changed then queueSave() end
+end
+
+-- уровень приоритета цели (0 — обычная). Действует только в радиусе farmRadius
+local function priorityLevel(c, d)
+	if not state.priorityEnabled or d > state.farmRadius then
+		return 0
+	end
+	return state.priorities[c.key] or 0
+end
+
+-- выбор цели: сначала по уровню приоритета, при равенстве — ближайшая.
+-- дорогая проверка candAlive выполняется только для тех, кто мог бы стать лучшим
 local function findNearest(fromPos)
-	local best, bestDist
+	local best, bestDist, bestLevel = nil, nil, -1
 	for _, c in ipairs(candidates) do
 		local root = c.root
-		if c.inst.Parent and root.Parent then
+		if c.inst.Parent and root.Parent and not isBanned(c) then
 			local d = (root.Position - fromPos).Magnitude
-			if (not bestDist or d < bestDist) and isAlive(c.inst) then
-				best, bestDist = c, d
+			local level = priorityLevel(c, d)
+			if (level > bestLevel or (level == bestLevel and d < bestDist)) and candAlive(c) then
+				best, bestDist, bestLevel = c, d, level
 			end
 		end
 	end
@@ -548,7 +689,7 @@ local function pressKey(keyCode, vk)
 	if VIM then
 		local ok = pcall(function()
 			VIM:SendKeyEvent(true, keyCode, false, game)
-			task.wait(0.03)
+			task.wait(0.08) -- удерживаем чуть дольше: короткие нажатия игра иногда не замечает
 			VIM:SendKeyEvent(false, keyCode, false, game)
 		end)
 		if ok then return end
@@ -556,10 +697,20 @@ local function pressKey(keyCode, vk)
 	if keypress and keyrelease then
 		pcall(function()
 			keypress(vk)
-			task.wait(0.03)
+			task.wait(0.08)
 			keyrelease(vk)
 		end)
 	end
+end
+
+local function isCharAlive()
+	local hum = getMyHumanoid()
+	return hum ~= nil and hum.Health > 0
+end
+
+local function hasToolEquipped()
+	local char = player.Character
+	return char ~= nil and char:FindFirstChildOfClass("Tool") ~= nil
 end
 
 -- клик в центр экрана
@@ -610,7 +761,8 @@ local function hasTargetsInRadius(rootPos)
 		local root = c.root
 		if c.inst.Parent and root.Parent
 			and (root.Position - rootPos).Magnitude <= radius
-			and isAlive(c.inst) then
+			and not isBanned(c)
+			and candAlive(c) then
 			return true
 		end
 	end
@@ -711,21 +863,28 @@ local function onDeath()
 		end)
 	end
 
-	-- клавиши: 2 -> (почти сразу) 1, раз в 5 секунд, 30 секунд
+	-- клавиши 2 -> (почти сразу) 1 по расписанию (раз в 5 секунд, 30 секунд).
+	-- Нажимаем только когда персонаж жив; если инструмент не взялся в руки — до 3 попыток.
 	if state.deathKeys then
 		task.spawn(function()
 			local cycles = math.floor(DEATH_KEYS_DURATION / DEATH_KEYS_INTERVAL)
+			local t0 = os.clock()
 			for i = 1, cycles do
+				local waitFor = t0 + (i - 1) * DEATH_KEYS_INTERVAL - os.clock()
+				if waitFor > 0 then
+					task.wait(waitFor)
+				end
 				if not active() then return end
-				local cycleStart = os.clock()
-				pressKey(Enum.KeyCode.Two, 0x32)
-				task.wait(KEYS_GAP)
-				if not active() then return end
-				pressKey(Enum.KeyCode.One, 0x31)
-				if i < cycles then
-					local rest = DEATH_KEYS_INTERVAL - (os.clock() - cycleStart)
-					if rest > 0 then
-						task.wait(rest)
+				if isCharAlive() then
+					for attempt = 1, 3 do
+						pressKey(Enum.KeyCode.Two, 0x32)
+						task.wait(KEYS_GAP)
+						if not active() then return end
+						pressKey(Enum.KeyCode.One, 0x31)
+						task.wait(0.25)
+						if hasToolEquipped() or not isCharAlive() or not active() then
+							break
+						end
 					end
 				end
 			end
@@ -772,7 +931,7 @@ local C = {
 	white = Color3.fromRGB(235, 235, 235),
 }
 
-local W = 256
+local W = 268
 local HEADER_H = 42
 local TAB_H = 28
 local TOP_H = HEADER_H + TAB_H + 1
@@ -988,9 +1147,10 @@ end
 local pageMain = newPage()
 local pageMove = newPage()
 local pageFarm = newPage()
+local pagePrio = newPage()
 local pageReset = newPage()
-local pages = { pageMain, pageMove, pageFarm, pageReset }
-local tabNames = { "ГЛАВНАЯ", "ДВИЖЕНИЕ", "ФАРМ", "СБРОС" }
+local pages = { pageMain, pageMove, pageFarm, pagePrio, pageReset }
+local tabNames = { "ГЛАВНАЯ", "ДВИЖ.", "ФАРМ", "ПРИОР.", "СБРОС" }
 local tabBtns, tabLines = {}, {}
 
 local function selectTab(index)
@@ -1008,7 +1168,7 @@ for i, name in ipairs(tabNames) do
 	b.Size = UDim2.new(1 / #tabNames, 0, 1, 0)
 	b.Position = UDim2.new((i - 1) / #tabNames, 0, 0, 0)
 	b.Font = Enum.Font.GothamBold
-	b.TextSize = 11
+	b.TextSize = 10
 	b.TextColor3 = C.sub
 	b.Text = name
 	b.Parent = tabBar
@@ -1024,6 +1184,9 @@ for i, name in ipairs(tabNames) do
 	tabLines[i] = ln
 	track(b.Activated:Connect(function()
 		selectTab(i)
+		if pages[i] == pagePrio and refreshPriorityList then
+			refreshPriorityList()
+		end
 	end))
 end
 
@@ -1161,7 +1324,9 @@ local function addToggle(page, text, get, set)
 	return { refresh = refresh }
 end
 
-local function addStepper(page, getText, onStep)
+-- числовая строка: подпись + поле, куда можно вписать значение вручную + кнопки − / +
+-- spec = { get = fn, set = fn(v), step = число | fn(dir, текущее), min, max, dec = знаков после запятой }
+local function addNumber(page, label, spec)
 	local row = Instance.new("Frame")
 	row.Size = UDim2.new(1, 0, 0, 32)
 	row.BackgroundColor3 = C.card
@@ -1170,36 +1335,78 @@ local function addStepper(page, getText, onStep)
 	row.Parent = page.frame
 	Instance.new("UICorner", row).CornerRadius = UDim.new(0, 8)
 
-	local label = Instance.new("TextLabel")
-	label.BackgroundTransparency = 1
-	label.Position = UDim2.fromOffset(10, 0)
-	label.Size = UDim2.new(1, -78, 1, 0)
-	label.Font = Enum.Font.Gotham
-	label.TextSize = 11
-	label.TextColor3 = C.text
-	label.TextXAlignment = Enum.TextXAlignment.Left
-	label.TextTruncate = Enum.TextTruncate.AtEnd
-	label.Parent = row
+	local lab = Instance.new("TextLabel")
+	lab.BackgroundTransparency = 1
+	lab.Position = UDim2.fromOffset(10, 0)
+	lab.Size = UDim2.new(1, -122, 1, 0)
+	lab.Font = Enum.Font.Gotham
+	lab.TextSize = 11
+	lab.TextColor3 = C.text
+	lab.TextXAlignment = Enum.TextXAlignment.Left
+	lab.TextTruncate = Enum.TextTruncate.AtEnd
+	lab.Text = label
+	lab.Parent = row
 
-	local plus = makeButton(row, "+", C.btn, C.text, UDim2.fromOffset(28, 24))
+	local plus = makeButton(row, "+", C.btn, C.text, UDim2.fromOffset(26, 24))
 	plus.AnchorPoint = Vector2.new(1, 0.5)
 	plus.Position = UDim2.new(1, -6, 0.5, 0)
 	plus.TextSize = 15
-	local minus = makeButton(row, "−", C.btn, C.text, UDim2.fromOffset(28, 24))
+	local minus = makeButton(row, "−", C.btn, C.text, UDim2.fromOffset(26, 24))
 	minus.AnchorPoint = Vector2.new(1, 0.5)
-	minus.Position = UDim2.new(1, -38, 0.5, 0)
+	minus.Position = UDim2.new(1, -36, 0.5, 0)
 	minus.TextSize = 15
 
-	local function refresh()
-		label.Text = getText()
+	local box = Instance.new("TextBox")
+	box.AnchorPoint = Vector2.new(1, 0.5)
+	box.Position = UDim2.new(1, -66, 0.5, 0)
+	box.Size = UDim2.fromOffset(48, 24)
+	box.BackgroundColor3 = C.bg
+	box.BorderSizePixel = 0
+	box.Font = Enum.Font.GothamBold
+	box.TextSize = 12
+	box.TextColor3 = C.yellow
+	box.ClearTextOnFocus = true
+	box.Text = ""
+	box.Parent = row
+	Instance.new("UICorner", box).CornerRadius = UDim.new(0, 6)
+
+	local function fmt(v)
+		local dec = spec.dec or 0
+		if dec > 0 then
+			return ("%." .. dec .. "f"):format(v)
+		end
+		return tostring(math.floor(v + 0.5))
 	end
-	track(plus.Activated:Connect(function()
-		onStep(1)
+	local function apply(v)
+		v = math.clamp(v, spec.min, spec.max)
+		local m = 10 ^ (spec.dec or 0)
+		spec.set(math.floor(v * m + 0.5) / m)
+	end
+	local function refresh()
+		box.Text = fmt(spec.get())
+	end
+	local function stepBy(dir)
+		local cur = spec.get()
+		local st = spec.step
+		if type(st) == "function" then
+			st = st(dir, cur)
+		end
+		apply(cur + dir * st)
+		refresh()
+	end
+
+	track(box.FocusLost:Connect(function()
+		local n = tonumber((box.Text:gsub(",", ".")))
+		if n then
+			apply(n)
+		end
 		refresh()
 	end))
+	track(plus.Activated:Connect(function()
+		stepBy(1)
+	end))
 	track(minus.Activated:Connect(function()
-		onStep(-1)
-		refresh()
+		stepBy(-1)
 	end))
 	refresh()
 	return { refresh = refresh }
@@ -1542,7 +1749,12 @@ local function unbindMove()
 end
 
 local function targetValid(t)
-	return t ~= nil and t.inst.Parent ~= nil and t.root.Parent ~= nil and isAlive(t.inst)
+	return t ~= nil and candAlive(t) and not isBanned(t)
+end
+
+-- скорость при подходе: не выше glideSpeed, замедляемся рядом с целью
+local function approachSpeed(d)
+	return math.min(state.glideSpeed, math.max(d * GLIDE_K, GLIDE_MIN_SPEED))
 end
 
 local function checkStuck(hum, root, dt, cond)
@@ -1563,7 +1775,10 @@ local function checkStuck(hum, root, dt, cond)
 	end
 end
 
+local ghostTarget, ghostSince, ghostSig, ghostPos = nil, 0, nil, nil -- страж «зависших» целей
+
 local function resetLatches()
+	ghostTarget = nil
 	retreating = false
 	zoneActive = false
 	zoneArmed = true
@@ -1688,7 +1903,7 @@ local function step(dt)
 			local dist = to.Magnitude
 			if dist > 0.05 then
 				local dir = to.Unit
-				local speed = math.clamp(dist * GLIDE_K, GLIDE_MIN_SPEED, state.glideSpeed)
+				local speed = approachSpeed(dist)
 				hum:Move(dir, false)
 				applyGlide(root, dir * speed, dt)
 			else
@@ -1734,11 +1949,31 @@ local function step(dt)
 		applyGlide(root, Vector3.zero, dt)
 		stuckTime = 0
 		setStatus("У цели: " .. target.name, C.text)
+
+		-- страж: мы стоим у цели, а её HP не меняется и она не двигается -> цель «зависла»
+		if state.ghostFilter then
+			local sig = hpSignature(target.inst)
+			local tpos = target.root.Position
+			if ghostTarget ~= target then
+				ghostTarget, ghostSince, ghostSig, ghostPos = target, now, sig, tpos
+			else
+				if sig ~= ghostSig or (tpos - ghostPos).Magnitude > 0.5 then
+					ghostSince, ghostSig, ghostPos = now, sig, tpos
+				end
+				if sig ~= nil and now - ghostSince >= state.ghostSeconds then
+					blacklist[target.inst] = now + GHOST_BAN_SECONDS
+					ghostTarget = nil
+					currentTarget = nil
+					setStatus("Пропущена зависшая цель: " .. target.name, C.yellow)
+				end
+			end
+		end
 		return
 	end
 
+	ghostTarget = nil
 	local dir = flat.Unit
-	local speed = math.clamp(remaining * GLIDE_K, GLIDE_MIN_SPEED, state.glideSpeed)
+	local speed = approachSpeed(remaining)
 	hum:Move(dir, false)
 	applyGlide(root, dir * speed, dt)
 	setStatus("К цели: " .. target.name, C.yellow)
@@ -1780,6 +2015,58 @@ local function stop()
 end
 
 ------------------------------------------------------------
+-- Вид сверху: камера над игроком, направлена вниз на него и едет вместе с ним
+------------------------------------------------------------
+local TOPVIEW_BIND = "NPCWalkerTopView"
+local topViewBound = false
+local topViewForward = Vector3.new(0, 0, -1)
+local savedCameraType = nil
+
+local function topViewStep()
+	local camera = workspace.CurrentCamera
+	local root = getMyRoot()
+	if not camera or not root then return end
+	if camera.CameraType ~= Enum.CameraType.Scriptable then
+		camera.CameraType = Enum.CameraType.Scriptable
+	end
+	local pos = root.Position
+	camera.CFrame = CFrame.lookAt(pos + Vector3.new(0, state.topViewHeight, 0), pos, topViewForward)
+end
+
+local function setTopView(on)
+	state.topView = on
+	local camera = workspace.CurrentCamera
+	if on then
+		if topViewBound then return end
+		if camera then
+			savedCameraType = camera.CameraType
+			-- направление «вверх экрана» берём из текущего взгляда камеры
+			local look = camera.CFrame.LookVector
+			local flat = Vector3.new(look.X, 0, look.Z)
+			topViewForward = flat.Magnitude > 0.05 and flat.Unit or Vector3.new(0, 0, -1)
+		end
+		topViewBound = true
+		RunService:BindToRenderStep(TOPVIEW_BIND, Enum.RenderPriority.Camera.Value + 1, topViewStep)
+	else
+		if topViewBound then
+			topViewBound = false
+			pcall(function() RunService:UnbindFromRenderStep(TOPVIEW_BIND) end)
+		end
+		if camera then
+			if savedCameraType and savedCameraType ~= Enum.CameraType.Scriptable then
+				camera.CameraType = savedCameraType
+			else
+				camera.CameraType = Enum.CameraType.Custom
+			end
+			local hum = getMyHumanoid()
+			if hum then
+				camera.CameraSubject = hum
+			end
+		end
+	end
+end
+
+------------------------------------------------------------
 -- Точка клика после смерти (маркер + стрелки) — объекты
 ------------------------------------------------------------
 local markerGui = Instance.new("ScreenGui")
@@ -1815,6 +2102,7 @@ local function shutdown()
 	stopMoving()
 	stopGlide()
 	setAutoRotate(true)
+	setTopView(false)
 	stopFarmLoops()
 	refreshId += 1
 	deathToken += 1
@@ -1841,19 +2129,12 @@ end
 ------------------------------------------------------------
 -- Содержимое вкладок
 ------------------------------------------------------------
-local function changeDist(dir)
-	local s = state.stopDist
-	local stepSize = ((dir > 0 and s >= 2) or (dir < 0 and s > 2)) and 0.5 or 0.1
-	s = s + dir * stepSize
-	s = math.floor(s * 10 + 0.5) / 10
-	state.stopDist = math.clamp(s, 0, 30)
-end
-
-local function changeSpeed(dir)
-	local s = state.glideSpeed
-	local stepSize = s >= 100 and 10 or 5
-	if dir < 0 and s <= 100 then stepSize = 5 end
-	state.glideSpeed = math.clamp(s + dir * stepSize, 5, 300)
+-- шаг зазора: 0.1 до 2 студов, дальше 0.5
+local function distStep(dir, cur)
+	if (dir > 0 and cur >= 2) or (dir < 0 and cur > 2) then
+		return 0.5
+	end
+	return 0.1
 end
 
 -- ===== ГЛАВНАЯ =====
@@ -1905,6 +2186,21 @@ do
 	farmOrder = nextOrder(pageMain)
 	buildFarmButton()
 
+	local topViewBtn = makeButton(pf, "", C.btn, C.text, UDim2.new(1, 0, 0, 32))
+	topViewBtn.LayoutOrder = nextOrder(pageMain)
+	topViewBtn.Font = Enum.Font.GothamMedium
+	topViewBtn.TextSize = 12
+	local function refreshTopViewBtn()
+		topViewBtn.Text = state.topView and "ВИД СВЕРХУ: ВКЛ" or "ВИД СВЕРХУ: ВЫКЛ"
+		topViewBtn.BackgroundColor3 = state.topView and C.yellow or C.btn
+		topViewBtn.TextColor3 = state.topView and C.black or C.text
+	end
+	refreshTopViewBtn()
+	track(topViewBtn.Activated:Connect(function()
+		setTopView(not state.topView)
+		refreshTopViewBtn()
+	end))
+
 	modeBtn = makeButton(pf, "", C.card, C.text, UDim2.new(1, 0, 0, 32))
 	modeBtn.LayoutOrder = nextOrder(pageMain)
 	modeBtn.Font = Enum.Font.GothamMedium
@@ -1944,32 +2240,62 @@ end
 do
 	local p = pageMove
 	addSection(p, "ЦЕЛЬ")
-	addStepper(p, function() return ("Зазор до цели: %.1f м"):format(state.stopDist) end, changeDist)
-	addStepper(p, function() return ("Скорость скольжения: %d"):format(state.glideSpeed) end, changeSpeed)
+	addNumber(p, "Зазор до цели, м", {
+		get = function() return state.stopDist end,
+		set = function(v) state.stopDist = v end,
+		step = distStep, min = 0, max = 30, dec = 1,
+	})
+	addNumber(p, "Скорость, ст/с", {
+		get = function() return state.glideSpeed end,
+		set = function(v) state.glideSpeed = v end,
+		step = 1, min = 1, max = 300, dec = 0,
+	})
 	addToggle(p, "Смотреть на цель", function() return state.face end, function(v)
 		state.face = v
 	end)
 	addToggle(p, "Прыжок при застревании", function() return state.autoJump end, function(v)
 		state.autoJump = v
 	end)
+	addToggle(p, "Пропуск зависших целей", function() return state.ghostFilter end, function(v)
+		state.ghostFilter = v
+	end)
+	addNumber(p, "Зависание цели, с", {
+		get = function() return state.ghostSeconds end,
+		set = function(v) state.ghostSeconds = v end,
+		step = 1, min = 3, max = 120, dec = 0,
+	})
+
+	addSection(p, "КАМЕРА")
+	addNumber(p, "Высота камеры", {
+		get = function() return state.topViewHeight end,
+		set = function(v) state.topViewHeight = v end,
+		step = 1, min = 5, max = 300, dec = 0,
+	})
+	addNote(p, "Кнопка «ВИД СВЕРХУ» находится на вкладке ГЛАВНАЯ.", 28)
 
 	addSection(p, "ЗДОРОВЬЕ")
 	addToggle(p, "Отход при низком HP", function() return state.retreat end, function(v)
 		state.retreat = v
 	end)
-	addStepper(p, function() return ("Порог отхода: HP ≤ %d"):format(state.retreatHp) end, function(dir)
-		state.retreatHp = math.clamp(state.retreatHp + dir * 5, 5, 100)
-	end)
+	addNumber(p, "Порог отхода, HP", {
+		get = function() return state.retreatHp end,
+		set = function(v) state.retreatHp = v end,
+		step = 1, min = 1, max = 100, dec = 0,
+	})
 	addToggle(p, "Безопасная зона (по HP)", function() return state.zoneEnabled end, function(v)
 		state.zoneEnabled = v
 		if not v then zoneActive = false end
 	end)
-	addStepper(p, function() return ("Порог зоны: HP ≤ %d"):format(state.zoneHp) end, function(dir)
-		state.zoneHp = math.clamp(state.zoneHp + dir * 5, 5, 100)
-	end)
-	addStepper(p, function() return ("Выход из зоны: %d с"):format(state.zoneRecover) end, function(dir)
-		state.zoneRecover = math.clamp(state.zoneRecover + dir, 1, 60)
-	end)
+	addNumber(p, "Порог зоны, HP", {
+		get = function() return state.zoneHp end,
+		set = function(v) state.zoneHp = v end,
+		step = 1, min = 1, max = 100, dec = 0,
+	})
+	addNumber(p, "Выход из зоны, с", {
+		get = function() return state.zoneRecover end,
+		set = function(v) state.zoneRecover = v end,
+		step = 1, min = 1, max = 120, dec = 0,
+	})
 	addNote(p, "Зона: после смерти не включается. Отсчёт выхода идёт, только когда персонаж уже в зоне.", 40)
 end
 
@@ -1981,9 +2307,11 @@ do
 	addToggle(p, "Постоянные клики", function() return state.autoClick end, function(v)
 		state.autoClick = v
 	end)
-	addStepper(p, function() return ("Кликов в секунду: %d"):format(state.clicksPerSec) end, function(dir)
-		state.clicksPerSec = math.clamp(state.clicksPerSec + dir, 1, 30)
-	end)
+	addNumber(p, "Кликов в секунду", {
+		get = function() return state.clicksPerSec end,
+		set = function(v) state.clicksPerSec = v end,
+		step = 1, min = 1, max = 30, dec = 0,
+	})
 
 	addSection(p, "СКИП BOSSBAR")
 	addToggle(p, "Авто-скип Bossbar", function() return state.autoSkip end, function(v)
@@ -1992,9 +2320,11 @@ do
 	addToggle(p, "Повтор скипа (2 с)", function() return state.skipRepeat end, function(v)
 		state.skipRepeat = v
 	end)
-	addStepper(p, function() return ("Радиус целей: %d м"):format(state.farmRadius) end, function(dir)
-		state.farmRadius = math.clamp(state.farmRadius + dir * 50, 50, 2000)
-	end)
+	addNumber(p, "Радиус целей, м", {
+		get = function() return state.farmRadius end,
+		set = function(v) state.farmRadius = v end,
+		step = 10, min = 10, max = 3000, dec = 0,
+	})
 
 	addSection(p, "ПОСЛЕ СМЕРТИ")
 	addToggle(p, "Клавиши 2 → 1 (30 с)", function() return state.deathKeys end, function(v)
@@ -2055,9 +2385,9 @@ do
 	end
 
 	local function movePoint(dx, dy)
-		local s = POINT_STEPS[stepIndex]
-		state.clickX = math.clamp(math.floor((state.clickX + dx * s) * 1000 + 0.5) / 1000, 0, 1)
-		state.clickY = math.clamp(math.floor((state.clickY + dy * s) * 1000 + 0.5) / 1000, 0, 1)
+		local s2 = POINT_STEPS[stepIndex]
+		state.clickX = math.clamp(math.floor((state.clickX + dx * s2) * 1000 + 0.5) / 1000, 0, 1)
+		state.clickY = math.clamp(math.floor((state.clickY + dy * s2) * 1000 + 0.5) / 1000, 0, 1)
 		refreshPoint()
 	end
 
@@ -2090,6 +2420,245 @@ do
 	setPointPanel(false)
 end
 
+-- ===== ПРИОРИТЕТ =====
+do
+	local p = pagePrio
+	local MAX_ROWS = 60
+
+	addSection(p, "НАСТРОЙКИ")
+	addToggle(p, "Приоритет целей", function() return state.priorityEnabled end, function(v)
+		state.priorityEnabled = v
+	end)
+	addNumber(p, "Уровень для новых", {
+		get = function() return state.newPriorityLevel end,
+		set = function(v) state.newPriorityLevel = v end,
+		step = 1, min = 1, max = 99, dec = 0,
+	})
+	addNote(p, "Больше число — выше приоритет. Приоритетная цель выбирается, даже если рядом есть другие. Работает в радиусе целей. Выше только отход и безопасная зона.", 66)
+
+	addSection(p, "ПОИСК / ДОБАВИТЬ ПО ИМЕНИ")
+	local searchRow = Instance.new("Frame")
+	searchRow.Size = UDim2.new(1, 0, 0, 32)
+	searchRow.BackgroundColor3 = C.card
+	searchRow.BorderSizePixel = 0
+	searchRow.LayoutOrder = nextOrder(p)
+	searchRow.Parent = p.frame
+	Instance.new("UICorner", searchRow).CornerRadius = UDim.new(0, 8)
+
+	local nameBox = Instance.new("TextBox")
+	nameBox.BackgroundTransparency = 1
+	nameBox.Position = UDim2.fromOffset(10, 0)
+	nameBox.Size = UDim2.new(1, -54, 1, 0)
+	nameBox.Font = Enum.Font.Gotham
+	nameBox.TextSize = 12
+	nameBox.TextColor3 = C.text
+	nameBox.PlaceholderColor3 = C.sub
+	nameBox.PlaceholderText = "Имя цели (фильтр / добавить)"
+	nameBox.TextXAlignment = Enum.TextXAlignment.Left
+	nameBox.ClearTextOnFocus = false
+	nameBox.ClipsDescendants = true
+	nameBox.Text = ""
+	nameBox.Parent = searchRow
+
+	local addBtn = makeButton(searchRow, "+", C.yellow, C.black, UDim2.fromOffset(32, 24))
+	addBtn.AnchorPoint = Vector2.new(1, 0.5)
+	addBtn.Position = UDim2.new(1, -6, 0.5, 0)
+	addBtn.TextSize = 16
+
+	addButton(p, "Очистить непомеченные", C.btn, C.text, 28, function()
+		for k in pairs(seenNames) do
+			if not state.priorities[k] then
+				seenNames[k] = nil
+			end
+		end
+		queueSave()
+		if refreshPriorityList then refreshPriorityList() end
+	end)
+
+	local listHeader = addSection(p, "ЦЕЛИ  ( ● — сейчас рядом )")
+
+	-- строки списка (создаются/удаляются по мере необходимости)
+	local rows = {}
+
+	local function destroyRow(key)
+		local r = rows[key]
+		if not r then return end
+		for _, c in ipairs(r.conns) do
+			pcall(function() c:Disconnect() end)
+		end
+		r.frame:Destroy()
+		rows[key] = nil
+	end
+
+	local function setLevel(key, level)
+		if level <= 0 then
+			state.priorities[key] = nil
+		else
+			state.priorities[key] = math.clamp(math.floor(level + 0.5), 1, 99)
+		end
+		queueSave()
+		if refreshPriorityList then refreshPriorityList() end
+	end
+
+	local function createRow(key)
+		local r = { conns = {} }
+		local frame = Instance.new("Frame")
+		frame.Size = UDim2.new(1, 0, 0, 30)
+		frame.BackgroundColor3 = C.card
+		frame.BorderSizePixel = 0
+		frame.Parent = p.frame
+		Instance.new("UICorner", frame).CornerRadius = UDim.new(0, 8)
+		r.frame = frame
+
+		local nameBtn = Instance.new("TextButton")
+		nameBtn.AutoButtonColor = false
+		nameBtn.BackgroundTransparency = 1
+		nameBtn.Size = UDim2.new(1, -96, 1, 0)
+		nameBtn.Font = Enum.Font.Gotham
+		nameBtn.TextSize = 11
+		nameBtn.TextXAlignment = Enum.TextXAlignment.Left
+		nameBtn.TextTruncate = Enum.TextTruncate.AtEnd
+		nameBtn.Text = ""
+		nameBtn.Parent = frame
+		Instance.new("UIPadding", nameBtn).PaddingLeft = UDim.new(0, 10)
+		r.nameBtn = nameBtn
+
+		local plus = makeButton(frame, "+", C.btn, C.text, UDim2.fromOffset(22, 22), r.conns)
+		plus.AnchorPoint = Vector2.new(1, 0.5)
+		plus.Position = UDim2.new(1, -4, 0.5, 0)
+		plus.TextSize = 14
+		local minus = makeButton(frame, "−", C.btn, C.text, UDim2.fromOffset(22, 22), r.conns)
+		minus.AnchorPoint = Vector2.new(1, 0.5)
+		minus.Position = UDim2.new(1, -68, 0.5, 0)
+		minus.TextSize = 14
+
+		local box = Instance.new("TextBox")
+		box.AnchorPoint = Vector2.new(1, 0.5)
+		box.Position = UDim2.new(1, -30, 0.5, 0)
+		box.Size = UDim2.fromOffset(34, 22)
+		box.BackgroundColor3 = C.bg
+		box.BorderSizePixel = 0
+		box.Font = Enum.Font.GothamBold
+		box.TextSize = 11
+		box.TextColor3 = C.yellow
+		box.ClearTextOnFocus = true
+		box.Text = ""
+		box.Parent = frame
+		Instance.new("UICorner", box).CornerRadius = UDim.new(0, 6)
+		r.plus, r.minus, r.box = plus, minus, box
+
+		r.conns[#r.conns + 1] = nameBtn.Activated:Connect(function()
+			if state.priorities[key] then
+				setLevel(key, 0)
+			else
+				setLevel(key, state.newPriorityLevel)
+			end
+		end)
+		r.conns[#r.conns + 1] = plus.Activated:Connect(function()
+			setLevel(key, (state.priorities[key] or 0) + 1)
+		end)
+		r.conns[#r.conns + 1] = minus.Activated:Connect(function()
+			setLevel(key, (state.priorities[key] or 1) - 1)
+		end)
+		r.conns[#r.conns + 1] = box.FocusLost:Connect(function()
+			local n = tonumber((box.Text:gsub(",", ".")))
+			if n then
+				setLevel(key, n)
+			elseif refreshPriorityList then
+				refreshPriorityList()
+			end
+		end)
+		rows[key] = r
+	end
+
+	local function updateRow(key, rank)
+		local r = rows[key]
+		local level = state.priorities[key]
+		local present = presentNow[key]
+		r.frame.LayoutOrder = 100 + rank
+		r.nameBtn.Text = (present and "● " or "   ") .. (seenNames[key] or key)
+		r.nameBtn.TextColor3 = level and C.yellow or (present and C.text or C.sub)
+		r.frame.BackgroundColor3 = level and Color3.fromRGB(46, 41, 20) or C.card
+		r.plus.Visible = level ~= nil
+		r.minus.Visible = level ~= nil
+		r.box.Visible = level ~= nil
+		if not r.box:IsFocused() then
+			r.box.Text = level and tostring(level) or ""
+		end
+	end
+
+	refreshPriorityList = function()
+		local filter = nameBox.Text:lower()
+		local keys = {}
+		for k in pairs(seenNames) do keys[k] = true end
+		for k in pairs(state.priorities) do keys[k] = true end
+
+		local list = {}
+		for k in pairs(keys) do
+			if filter == "" or k:find(filter, 1, true) then
+				list[#list + 1] = k
+			end
+		end
+		table.sort(list, function(a, b)
+			local la, lb = state.priorities[a] or 0, state.priorities[b] or 0
+			if la ~= lb then return la > lb end
+			local pa, pb = presentNow[a] and 1 or 0, presentNow[b] and 1 or 0
+			if pa ~= pb then return pa > pb end
+			return a < b
+		end)
+
+		local shown = {}
+		for i = 1, math.min(#list, MAX_ROWS) do
+			local k = list[i]
+			shown[k] = true
+			if not rows[k] then
+				createRow(k)
+			end
+			updateRow(k, i)
+		end
+		for k in pairs(rows) do
+			if not shown[k] then
+				destroyRow(k)
+			end
+		end
+		listHeader.Text = ("ЦЕЛИ (%d)  ( ● — сейчас рядом )"):format(#list)
+	end
+
+	local function addByName()
+		local raw = trim(nameBox.Text)
+		if raw == "" then return end
+		local key = raw:lower()
+		if not seenNames[key] then
+			seenNames[key] = raw
+		end
+		state.priorities[key] = state.newPriorityLevel
+		nameBox.Text = ""
+		queueSave()
+		refreshPriorityList()
+	end
+
+	track(addBtn.Activated:Connect(addByName))
+	track(nameBox.FocusLost:Connect(function(enterPressed)
+		if enterPressed then
+			addByName()
+		end
+	end))
+	track(nameBox:GetPropertyChangedSignal("Text"):Connect(function()
+		refreshPriorityList()
+	end))
+
+	-- пока вкладка открыта, список обновляется раз в секунду
+	task.spawn(function()
+		while state.alive do
+			if p.frame.Visible then
+				pcall(refreshPriorityList)
+			end
+			task.wait(1)
+		end
+	end)
+	refreshPriorityList()
+end
+
 -- ===== СБРОС =====
 do
 	local p = pageReset
@@ -2099,14 +2668,19 @@ do
 		goneCount = 0
 		if refreshResetInfo then refreshResetInfo() end
 	end)
-	addStepper(p, function() return ("Каждые N пропаданий: %d"):format(state.resetEvery) end, function(dir)
-		state.resetEvery = math.clamp(state.resetEvery + dir, 1, 99)
-		if refreshResetInfo then refreshResetInfo() end
-	end)
-	addStepper(p, function() return ("Пауза 2-го ресета: %.1f с"):format(state.resetDelay) end, function(dir)
-		local v = state.resetDelay + dir * 0.5
-		state.resetDelay = math.clamp(math.floor(v * 2 + 0.5) / 2, 0.5, 30)
-	end)
+	addNumber(p, "Пропаданий (N)", {
+		get = function() return state.resetEvery end,
+		set = function(v)
+			state.resetEvery = v
+			if refreshResetInfo then refreshResetInfo() end
+		end,
+		step = 1, min = 1, max = 99, dec = 0,
+	})
+	addNumber(p, "Пауза 2-го ресета, с", {
+		get = function() return state.resetDelay end,
+		set = function(v) state.resetDelay = v end,
+		step = 0.5, min = 0.5, max = 60, dec = 1,
+	})
 
 	local info = addNote(p, "", 30)
 	info.TextColor3 = C.text
@@ -2120,7 +2694,7 @@ do
 	addButton(p, "Запустить цикл сейчас", C.btn, C.text, 32, function()
 		runResetCycle()
 	end)
-	addNote(p, "Цикл: первый ресет персонажа сразу, второй — через указанную паузу.", 30)
+	addNote(p, "Каждые N пропаданий всех целей: первый ресет сразу, второй — через паузу.", 40)
 
 	addSection(p, "АВТО-СБРОС ФАРМА (FPS)")
 	addToggle(p, ("Сброс фарма: FPS ≤ %d (%d с)"):format(FPS_RESET_BELOW, FPS_LOW_SECONDS),
@@ -2183,8 +2757,9 @@ task.spawn(function()
 		if root then
 			local target = findNearest(root.Position)
 			if target then
-				infoLabel.Text = ("%s · зазор %.1f м · целей %d"):format(
-					target.name, edgeGap(target, root), #candidates
+				local lvl = state.priorities[target.key]
+				infoLabel.Text = ("%s%s · зазор %.1f м · целей %d"):format(
+					lvl and ("★" .. lvl .. " ") or "", target.name, edgeGap(target, root), #candidates
 				)
 			else
 				infoLabel.Text = searchNote or "Целей нет"
