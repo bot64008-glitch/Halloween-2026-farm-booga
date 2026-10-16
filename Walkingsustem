@@ -1,16 +1,25 @@
 --[[
-    WEB VALLEY STUDIO — NPC Walker v14
+    WEB VALLEY STUDIO — NPC Walker v17
 
-    Что нового в v14:
-      • Исправление «зависших» целей: труп без Humanoid, своя система HP, флаги смерти,
-        цель вне карты — теперь считаются мёртвыми. Плюс страж: цель, у которой HP не меняется
-        и которая не двигается, пока мы стоим рядом, временно пропускается.
-      • Клавиши 2 → 1 после смерти надёжнее: дольше удержание, ждём пока персонаж жив, повторы.
-      • Кнопка «ВИД СВЕРХУ» (ГЛАВНАЯ): камера на N студов выше и смотрит на игрока.
-      • Вкладка «ПРИОР.»: список замеченных целей (имена сохраняются), приоритет и уровень,
-        поиск/добавление по имени. Приоритетная цель выбирается даже если рядом есть другие.
-        Выше приоритета только отход и безопасная зона.
-      • Скорость меняется на 1, а любое число можно вписать вручную.
+    v17 — ИСПРАВЛЕНИЕ ЗАПУСКА: в v15–v16 меню не появлялось. Причина — слишком много локальных
+    переменных в основном блоке (лимит Luau — 200). Теперь функции и переменные вынесены в таблицу M.
+    Все функции v15 и v16 сохранены без изменений.
+
+
+    Что нового в v16 — особые маршруты боссов (настройки: вкладка ПРИОР., раздел «БОССЫ»):
+
+      The Undying Guardian:
+        1) подойти к боссу и сразу уйти в безопасную зону;
+        2) в зоне, не выходя из неё, встать в ДАЛЬНИЙ от босса угол и ждать,
+           пока босс не окажется в зоне или чуть дальше её границы (настраиваемый запас);
+        3) тогда подойти к боссу, всё ещё не выходя из зоны; если босс снова ушёл — обратно в угол;
+        4) так до тех пор, пока босс не пропадёт. После этого — обычные паттерны, пока он не появится снова.
+
+      The Spooky Knight: то же самое, но без дальнего угла — достаточно не выходить из зоны
+        и подходить к боссу, когда он в зоне или рядом с ней.
+
+      Босс «залипает» как цель, пока жив. Отход и безопасная зона по HP по-прежнему важнее маршрута.
+      Раньше: защита от «призрачных» целей, приоритеты, вид сверху, ручной ввод чисел, сброс и т.д.
 ]]
 
 local Players = game:GetService("Players")
@@ -22,43 +31,48 @@ local CollectionService = game:GetService("CollectionService")
 local player = Players.LocalPlayer
 local playerGui = player:WaitForChild("PlayerGui")
 
-local LOGO_ID = 128430833466493
+-- Пространство имён: сюда вынесены почти все функции и переменные,
+-- чтобы не упереться в лимит локальных переменных Luau (200 на функцию).
+local M = {}
+
+M.LOGO_ID = 128430833466493
 
 ------------------------------------------------------------
 -- Постоянные настройки (то, что не вынесено в меню)
 ------------------------------------------------------------
 -- Безопасная зона (углы по порядку обхода) — Y не учитывается
-local ZONE_POINTS = {
+M.ZONE_POINTS = {
 	Vector3.new(-1143.0, 121.0, -58.2),
 	Vector3.new(-1146.6, 121.0, -42.7),
 	Vector3.new(-1170.9, 121.0, -44.1),
 	Vector3.new(-1156.4, 121.0, -70.5),
 }
-local ZONE_INSET = 1.0           -- на сколько студов от края заходим внутрь зоны
-local ZONE_RELEASE_DELAY = 1.0   -- сколько секунд без целей нужно, чтобы снять ограничение зоны
+M.ZONE_INSET = 1.0           -- на сколько студов от края заходим внутрь зоны
+M.ZONE_RELEASE_DELAY = 1.0   -- сколько секунд без целей нужно, чтобы снять ограничение зоны
 
-local FACE_SMOOTH = 20           -- плавность поворота к цели
-local GLIDE_SMOOTH = 12          -- плавность разгона/смены направления
-local GLIDE_K = 8                -- плавность торможения у цели
-local GLIDE_MIN_SPEED = 2        -- минимальная скорость при подходе (студы/сек)
+M.FACE_SMOOTH = 20           -- плавность поворота к цели
+M.GLIDE_SMOOTH = 12          -- плавность разгона/смены направления
+M.GLIDE_K = 8                -- плавность торможения у цели
+M.GLIDE_MIN_SPEED = 2        -- минимальная скорость при подходе (студы/сек)
 
-local GHOST_BAN_SECONDS = 30   -- на сколько секунд игнорируем «зависшую» цель
-local SKIP_COOLDOWN = 2          -- пауза между повторами Skip
-local EMPTY_DEBOUNCE = 0.5       -- цели должны отсутствовать N сек, чтобы считаться «пропавшими»
+M.GHOST_BAN_SECONDS = 30   -- на сколько секунд игнорируем «зависшую» цель
+M.DEAD_MEMORY = 20         -- сколько секунд помним, что цель умерла (потом проверяем заново)
+M.SKIP_COOLDOWN = 2          -- пауза между повторами Skip
+M.EMPTY_DEBOUNCE = 0.5       -- цели должны отсутствовать N сек, чтобы считаться «пропавшими»
 
-local DEATH_KEYS_DURATION = 30   -- после смерти: клавиши 2 -> 1 в течение N сек
-local DEATH_KEYS_INTERVAL = 5    -- ... раз в N сек
-local KEYS_GAP = 0.1             -- пауза между клавишей 2 и 1
-local DEATH_READY_DURATION = 10  -- после смерти: Ready в течение N сек
-local DEATH_READY_INTERVAL = 1   -- ... раз в N сек
-local DEATH_CLICK_DELAY = 5      -- после смерти: через N сек ...
-local DEATH_CLICK_COUNT = 2      -- ... столько кликов ...
-local DEATH_CLICK_GAP = 0.5      -- ... с такой паузой в выбранную точку
+M.DEATH_KEYS_DURATION = 30   -- после смерти: клавиши 2 -> 1 в течение N сек
+M.DEATH_KEYS_INTERVAL = 5    -- ... раз в N сек
+M.KEYS_GAP = 0.1             -- пауза между клавишей 2 и 1
+M.DEATH_READY_DURATION = 10  -- после смерти: Ready в течение N сек
+M.DEATH_READY_INTERVAL = 1   -- ... раз в N сек
+M.DEATH_CLICK_DELAY = 5      -- после смерти: через N сек ...
+M.DEATH_CLICK_COUNT = 2      -- ... столько кликов ...
+M.DEATH_CLICK_GAP = 0.5      -- ... с такой паузой в выбранную точку
 
-local FPS_RESET_BELOW = 15       -- пересоздание кнопки фарма, если FPS <= этого значения ...
-local FPS_LOW_SECONDS = 20       -- ... держится столько секунд подряд
-local FARM_RESET_COOLDOWN = 20   -- не чаще чем раз в N сек
-local FARM_RESET_PAUSE = 1       -- пауза во время сброса фарма
+M.FPS_RESET_BELOW = 15       -- пересоздание кнопки фарма, если FPS <= этого значения ...
+M.FPS_LOW_SECONDS = 20       -- ... держится столько секунд подряд
+M.FARM_RESET_COOLDOWN = 20   -- не чаще чем раз в N сек
+M.FARM_RESET_PAUSE = 1       -- пауза во время сброса фарма
 
 ------------------------------------------------------------
 -- Состояние (всё это можно менять в меню)
@@ -109,8 +123,20 @@ local state = {
 	-- камера и зависшие цели
 	topView = false,       -- вид сверху
 	topViewHeight = 20,    -- высота камеры над игроком
-	ghostFilter = true,    -- пропускать «зависшие» цели
-	ghostSeconds = 12,     -- сколько секунд цель без изменений рядом с нами считается зависшей
+	ghostFilter = true,    -- страж «у цели»: HP/позиция не меняются
+	ghostSeconds = 12,     -- сколько секунд ждать до пропуска цели (стражи прогресса и «у цели»)
+	deathEvents = true,    -- следить за событиями смерти цели
+	posCheck = true,       -- цель вне карты
+	visCheck = true,       -- цель невидима
+	progressCheck = true,  -- нет прогресса в приближении
+	animCheck = false,     -- нет анимаций (эксперимент)
+
+	-- боссы с особым маршрутом
+	bossGuardian = true,      -- The Undying Guardian
+	bossKnight = true,        -- The Spooky Knight
+	bossApproachFirst = true, -- сначала подойти к боссу, потом в зону
+	bossAutoPriority = false, -- боссы с маршрутом — высший приоритет
+	bossMargin = 8,           -- насколько далеко за границей зоны босс ещё считается «рядом с зоной»
 }
 
 local connections = {}
@@ -128,34 +154,34 @@ local HttpService = game:GetService("HttpService")
 ------------------------------------------------------------
 -- Приоритеты и «замеченные» цели (сохраняются в файл, если экзекутор поддерживает writefile)
 ------------------------------------------------------------
-local SAVE_FILE = "WebValley_NPCWalker.json"
-local seenNames = {}              -- ключ (имя в нижнем регистре) -> имя для показа
-local presentNow = {}             -- ключи целей, которые сейчас в радиусе
-local saveQueued = false
-local refreshPriorityList = nil   -- назначается позже (обновляет список на вкладке ПРИОР.)
-local onCandidatesUpdated = nil   -- назначается позже (запоминает замеченные цели)
+M.SAVE_FILE = "WebValley_NPCWalker.json"
+M.seenNames = {}              -- ключ (имя в нижнем регистре) -> имя для показа
+M.presentNow = {}             -- ключи целей, которые сейчас в радиусе
+M.saveQueued = false
+M.refreshPriorityList = nil   -- назначается позже (обновляет список на вкладке ПРИОР.)
+M.onCandidatesUpdated = nil   -- назначается позже (запоминает замеченные цели)
 
-local function saveData()
+function M.saveData()
 	if not writefile then return end
 	pcall(function()
-		writefile(SAVE_FILE, HttpService:JSONEncode({ priorities = state.priorities, seen = seenNames }))
+		writefile(M.SAVE_FILE, HttpService:JSONEncode({ priorities = state.priorities, seen = M.seenNames }))
 	end)
 end
 
-local function queueSave()
-	if saveQueued then return end
-	saveQueued = true
+function M.queueSave()
+	if M.saveQueued then return end
+	M.saveQueued = true
 	task.delay(1.5, function()
-		saveQueued = false
-		saveData()
+		M.saveQueued = false
+		M.saveData()
 	end)
 end
 
-local function loadData()
+function M.loadData()
 	if not (readfile and isfile) then return end
 	local ok, raw = pcall(function()
-		if isfile(SAVE_FILE) then
-			return readfile(SAVE_FILE)
+		if isfile(M.SAVE_FILE) then
+			return readfile(M.SAVE_FILE)
 		end
 	end)
 	if not ok or not raw then return end
@@ -171,48 +197,48 @@ local function loadData()
 	if type(data.seen) == "table" then
 		for k, v in pairs(data.seen) do
 			if type(k) == "string" and type(v) == "string" then
-				seenNames[k] = v
+				M.seenNames[k] = v
 			end
 		end
 	end
 end
-loadData()
+M.loadData()
 
 ------------------------------------------------------------
 -- Режимы поиска
 ------------------------------------------------------------
-local MODES = {
+M.MODES = {
 	{ id = "humanoid", label = "Humanoid", needsQuery = false },
 	{ id = "auto", label = "Авто (умный)", needsQuery = false },
 	{ id = "folder", label = "Папка", needsQuery = true, placeholder = "Путь: Mobs  или  Enemies.Zone1" },
 	{ id = "name", label = "Имя", needsQuery = true, placeholder = "Имя: Zombie, Boss (через запятую)" },
 	{ id = "tag", label = "Тег", needsQuery = true, placeholder = "Тег CollectionService: Enemy" },
 }
-local MODES_BY_ID = {}
-for _, m in ipairs(MODES) do
-	MODES_BY_ID[m.id] = m
+M.MODES_BY_ID = {}
+for _, m in ipairs(M.MODES) do
+	M.MODES_BY_ID[m.id] = m
 end
 
-local HP_NAMES = { "Health", "HP", "health", "hp" }
+M.HP_NAMES = { "Health", "HP", "health", "hp" }
 
 ------------------------------------------------------------
 -- Геометрия безопасной зоны (в плоскости XZ)
 ------------------------------------------------------------
-local ZONE_CENTER = Vector3.zero
+M.ZONE_CENTER = Vector3.zero
 do
 	local sx, sz = 0, 0
-	for _, p in ipairs(ZONE_POINTS) do
+	for _, p in ipairs(M.ZONE_POINTS) do
 		sx += p.X
 		sz += p.Z
 	end
-	ZONE_CENTER = Vector3.new(sx / #ZONE_POINTS, 0, sz / #ZONE_POINTS)
+	M.ZONE_CENTER = Vector3.new(sx / #M.ZONE_POINTS, 0, sz / #M.ZONE_POINTS)
 end
 
-local function pointInZone(p)
+function M.pointInZone(p)
 	local inside = false
-	local j = #ZONE_POINTS
-	for i = 1, #ZONE_POINTS do
-		local a, b = ZONE_POINTS[i], ZONE_POINTS[j]
+	local j = #M.ZONE_POINTS
+	for i = 1, #M.ZONE_POINTS do
+		local a, b = M.ZONE_POINTS[i], M.ZONE_POINTS[j]
 		if (a.Z > p.Z) ~= (b.Z > p.Z) then
 			local xAt = (b.X - a.X) * (p.Z - a.Z) / (b.Z - a.Z) + a.X
 			if p.X < xAt then
@@ -224,7 +250,7 @@ local function pointInZone(p)
 	return inside
 end
 
-local function closestOnSegment(p, a, b)
+function M.closestOnSegment(p, a, b)
 	local abx, abz = b.X - a.X, b.Z - a.Z
 	local len2 = abx * abx + abz * abz
 	local t = 0
@@ -236,20 +262,20 @@ local function closestOnSegment(p, a, b)
 end
 
 -- куда идти, чтобы оказаться внутри зоны
-local function zoneGoalPoint(p)
+function M.zoneGoalPoint(p)
 	local best, bestD
-	for i = 1, #ZONE_POINTS do
-		local a = ZONE_POINTS[i]
-		local b = ZONE_POINTS[(i % #ZONE_POINTS) + 1]
-		local c = closestOnSegment(p, a, b)
+	for i = 1, #M.ZONE_POINTS do
+		local a = M.ZONE_POINTS[i]
+		local b = M.ZONE_POINTS[(i % #M.ZONE_POINTS) + 1]
+		local c = M.closestOnSegment(p, a, b)
 		local d = (Vector3.new(c.X, 0, c.Z) - Vector3.new(p.X, 0, p.Z)).Magnitude
 		if not bestD or d < bestD then
 			best, bestD = c, d
 		end
 	end
-	local toCenter = ZONE_CENTER - best
+	local toCenter = M.ZONE_CENTER - best
 	if toCenter.Magnitude > 0.01 then
-		best = best + toCenter.Unit * math.min(ZONE_INSET, toCenter.Magnitude)
+		best = best + toCenter.Unit * math.min(M.ZONE_INSET, toCenter.Magnitude)
 	end
 	return best
 end
@@ -257,7 +283,7 @@ end
 ------------------------------------------------------------
 -- Вспомогательные функции для NPC
 ------------------------------------------------------------
-local function isPlayerRelated(inst)
+function M.isPlayerRelated(inst)
 	local cur = inst
 	while cur and cur ~= workspace do
 		if cur:IsA("Model") and Players:GetPlayerFromCharacter(cur) then
@@ -268,7 +294,7 @@ local function isPlayerRelated(inst)
 	return false
 end
 
-local function getRoot(model)
+function M.getRoot(model)
 	if model.PrimaryPart then
 		return model.PrimaryPart
 	end
@@ -282,10 +308,10 @@ local function getRoot(model)
 end
 
 -- признаки смерти, которые игры ставят на модель
-local DEAD_FLAGS = { "Dead", "IsDead", "Died", "dead", "isDead" }
+M.DEAD_FLAGS = { "Dead", "IsDead", "Died", "dead", "isDead" }
 
 -- Жив ли NPC: учитываем и Humanoid, и собственную систему HP (атрибуты/значения), и флаги смерти
-local function isAlive(inst)
+function M.isAlive(inst)
 	if not inst:IsDescendantOf(workspace) then
 		return false
 	end
@@ -294,12 +320,12 @@ local function isAlive(inst)
 		if hum.Health <= 0 then return false end
 		if hum:GetState() == Enum.HumanoidStateType.Dead then return false end
 	end
-	for _, n in ipairs(DEAD_FLAGS) do
+	for _, n in ipairs(M.DEAD_FLAGS) do
 		if inst:GetAttribute(n) == true then
 			return false
 		end
 	end
-	for _, n in ipairs(HP_NAMES) do
+	for _, n in ipairs(M.HP_NAMES) do
 		local a = inst:GetAttribute(n)
 		if type(a) == "number" then
 			return a > 0
@@ -313,10 +339,10 @@ local function isAlive(inst)
 end
 
 -- «подпись» здоровья цели: число (Humanoid.Health / HP) или nil, если данных нет
-local function hpSignature(inst)
+function M.hpSignature(inst)
 	local hum = inst:FindFirstChildOfClass("Humanoid")
 	if hum then return hum.Health end
-	for _, n in ipairs(HP_NAMES) do
+	for _, n in ipairs(M.HP_NAMES) do
 		local a = inst:GetAttribute(n)
 		if type(a) == "number" then return a end
 		local v = inst:FindFirstChild(n)
@@ -325,8 +351,8 @@ local function hpSignature(inst)
 	return nil
 end
 
-local function hasHpValue(inst)
-	for _, n in ipairs(HP_NAMES) do
+function M.hasHpValue(inst)
+	for _, n in ipairs(M.HP_NAMES) do
 		if type(inst:GetAttribute(n)) == "number" then
 			return true
 		end
@@ -339,7 +365,7 @@ local function hasHpValue(inst)
 end
 
 -- Горизонтальный "радиус" цели — нужен, чтобы считать расстояние от края
-local function calcRadius(inst, root)
+function M.calcRadius(inst, root)
 	local size = root.Size
 	if inst:IsA("Model") then
 		local ok, s = pcall(function() return inst:GetExtentsSize() end)
@@ -350,73 +376,78 @@ local function calcRadius(inst, root)
 	return (size.X + size.Z) / 4
 end
 
-local function makeCandidate(inst)
+function M.makeCandidate(inst)
 	if not inst or not inst.Parent then return nil end
-	if isPlayerRelated(inst) then return nil end
+	if M.isPlayerRelated(inst) then return nil end
 	local root
 	if inst:IsA("Model") then
-		root = getRoot(inst)
+		root = M.getRoot(inst)
 	elseif inst:IsA("BasePart") then
 		root = inst
 	else
 		return nil
 	end
 	if not root then return nil end
-	if not isAlive(inst) then return nil end
+	if not M.isAlive(inst) then return nil end
 	return {
 		inst = inst, root = root, name = inst.Name, key = inst.Name:lower(),
-		hum = inst:FindFirstChildOfClass("Humanoid"), radius = calcRadius(inst, root),
+		hum = inst:FindFirstChildOfClass("Humanoid"), radius = M.calcRadius(inst, root),
 	}
 end
 
+-- метки смерти от событий: [inst] = os.clock() момента смерти (помним DEAD_MEMORY секунд)
+M.deadSet = setmetatable({}, { __mode = "k" })
+
 -- цель жива и по-прежнему на карте (учитываем и пропавший Humanoid — «труп»)
-local function candAlive(c)
+function M.candAlive(c)
 	local inst = c.inst
 	if not inst.Parent or not c.root.Parent then return false end
+	local dsince = M.deadSet[inst]
+	if dsince and os.clock() - dsince < M.DEAD_MEMORY then return false end
 	local hum = c.hum
 	if hum and not hum:IsDescendantOf(inst) then return false end
-	return isAlive(inst)
+	return M.isAlive(inst)
 end
 
 -- временно игнорируемые («зависшие») цели: [inst] = os.clock() до которого игнорируем
-local blacklist = setmetatable({}, { __mode = "k" })
-local function isBanned(c)
-	local ban = blacklist[c.inst]
+M.blacklist = setmetatable({}, { __mode = "k" })
+function M.isBanned(c)
+	local ban = M.blacklist[c.inst]
 	return ban ~= nil and ban > os.clock()
 end
 
 ------------------------------------------------------------
 -- Кандидаты (NPC) и их обновление
 ------------------------------------------------------------
-local candidates = {}
-local candidatesReady = false  -- true, когда список целей уже собран для текущего режима
-local searchNote = nil
-local refreshId = 0
-local forceRefresh = false
+M.candidates = {}
+M.candidatesReady = false  -- true, когда список целей уже собран для текущего режима
+M.searchNote = nil
+M.refreshId = 0
+M.forceRefresh = false
 
-local npcHumanoids = {}
-local function addHumanoid(inst)
+M.npcHumanoids = {}
+function M.addHumanoid(inst)
 	if inst:IsA("Humanoid") then
-		npcHumanoids[inst] = true
+		M.npcHumanoids[inst] = true
 	end
 end
 for _, inst in ipairs(workspace:GetDescendants()) do
-	addHumanoid(inst)
+	M.addHumanoid(inst)
 end
-track(workspace.DescendantAdded:Connect(addHumanoid))
+track(workspace.DescendantAdded:Connect(M.addHumanoid))
 track(workspace.DescendantRemoving:Connect(function(inst)
-	npcHumanoids[inst] = nil
+	M.npcHumanoids[inst] = nil
 end))
 
-local function requestRefresh()
-	refreshId += 1
-	forceRefresh = true
-	candidates = {}
-	candidatesReady = false
-	searchNote = nil
+function M.requestRefresh()
+	M.refreshId += 1
+	M.forceRefresh = true
+	M.candidates = {}
+	M.candidatesReady = false
+	M.searchNote = nil
 end
 
-local function resolvePath(path)
+function M.resolvePath(path)
 	local cur = workspace
 	for seg in path:gmatch("[^%.%/>]+") do
 		seg = trim(seg)
@@ -430,37 +461,37 @@ local function resolvePath(path)
 	return cur
 end
 
-local function collectFromContainer(container, out, seen, depth)
+function M.collectFromContainer(container, out, seen, depth)
 	if depth > 4 then return end
 	for _, child in ipairs(container:GetChildren()) do
 		if child:IsA("Model") or child:IsA("BasePart") then
 			if not seen[child] then
-				local c = makeCandidate(child)
+				local c = M.makeCandidate(child)
 				if c then
 					seen[child] = true
 					out[#out + 1] = c
 				end
 			end
 		elseif child:IsA("Folder") then
-			collectFromContainer(child, out, seen, depth + 1)
+			M.collectFromContainer(child, out, seen, depth + 1)
 		end
 	end
 end
 
 -- Сканирование workspace с паузами, чтобы не фризить игру
-local function scanWorkspace(matchFn, id)
+function M.scanWorkspace(matchFn, id)
 	local out = {}
 	local n = 0
 	for _, inst in ipairs(workspace:GetDescendants()) do
 		n += 1
 		if n % 500 == 0 then
 			task.wait()
-			if id ~= refreshId or not state.alive then
+			if id ~= M.refreshId or not state.alive then
 				return nil
 			end
 		end
 		if inst:IsA("Model") and matchFn(inst) then
-			local c = makeCandidate(inst)
+			local c = M.makeCandidate(inst)
 			if c then
 				out[#out + 1] = c
 			end
@@ -469,18 +500,18 @@ local function scanWorkspace(matchFn, id)
 	return out
 end
 
-local function refreshCandidates()
-	local id = refreshId
+function M.refreshCandidates()
+	local id = M.refreshId
 	local mode = state.mode
 	local q = trim(state.queries[mode] or "")
 	local out, note = {}, nil
 
 	if mode == "humanoid" then
 		local seen = {}
-		for hum in pairs(npcHumanoids) do
+		for hum in pairs(M.npcHumanoids) do
 			local model = hum.Parent
 			if model and model:IsA("Model") and not seen[model] then
-				local c = makeCandidate(model)
+				local c = M.makeCandidate(model)
 				if c then
 					seen[model] = true
 					out[#out + 1] = c
@@ -489,24 +520,24 @@ local function refreshCandidates()
 		end
 
 	elseif mode == "auto" then
-		out = scanWorkspace(function(m)
+		out = M.scanWorkspace(function(m)
 			return m:FindFirstChildOfClass("Humanoid") ~= nil
 				or m:FindFirstChildOfClass("AnimationController") ~= nil
-				or hasHpValue(m)
+				or M.hasHpValue(m)
 		end, id)
 
 	elseif mode == "folder" then
 		if q == "" then
 			note = "Введите путь к папке"
 		else
-			local container = resolvePath(q)
+			local container = M.resolvePath(q)
 			if not container then
 				note = "Папка не найдена"
 			else
 				local seen = {}
-				collectFromContainer(container, out, seen, 0)
+				M.collectFromContainer(container, out, seen, 0)
 				if #out == 0 and (container:IsA("Model") or container:IsA("BasePart")) then
-					local c = makeCandidate(container)
+					local c = M.makeCandidate(container)
 					if c then out[1] = c end
 				end
 				if #out == 0 then
@@ -526,7 +557,7 @@ local function refreshCandidates()
 		if #names == 0 then
 			note = "Введите имя NPC"
 		else
-			out = scanWorkspace(function(m)
+			out = M.scanWorkspace(function(m)
 				local nm = m.Name:lower()
 				for _, s in ipairs(names) do
 					if nm:find(s, 1, true) then
@@ -544,7 +575,7 @@ local function refreshCandidates()
 			local seen = {}
 			for _, inst in ipairs(CollectionService:GetTagged(q)) do
 				if not seen[inst] and inst:IsDescendantOf(workspace) then
-					local c = makeCandidate(inst)
+					local c = M.makeCandidate(inst)
 					if c then
 						seen[inst] = true
 						out[#out + 1] = c
@@ -557,60 +588,79 @@ local function refreshCandidates()
 		end
 	end
 
-	if out == nil or id ~= refreshId then
+	if out == nil or id ~= M.refreshId then
 		return -- поиск отменён (сменили режим/запрос)
 	end
-	candidates = out
-	searchNote = note
-	candidatesReady = true
-	if onCandidatesUpdated then onCandidatesUpdated() end
+	M.candidates = out
+	M.searchNote = note
+	M.candidatesReady = true
+	if M.onCandidatesUpdated then M.onCandidatesUpdated() end
 end
 
 task.spawn(function()
 	while state.alive do
-		refreshCandidates()
+		M.refreshCandidates()
 		local interval = (state.mode == "auto" or state.mode == "name") and 3 or 1
 		local waited = 0
-		while waited < interval and not forceRefresh and state.alive do
+		while waited < interval and not M.forceRefresh and state.alive do
 			waited += task.wait(0.1)
 		end
-		forceRefresh = false
+		M.forceRefresh = false
 	end
 end)
 
-local function getMyRoot()
+function M.getMyRoot()
 	local char = player.Character
 	return char and char:FindFirstChild("HumanoidRootPart")
 end
 
-local function getMyHumanoid()
+function M.getMyHumanoid()
 	local char = player.Character
 	return char and char:FindFirstChildOfClass("Humanoid")
 end
 
 -- запоминаем имена целей, замеченных в радиусе (для вкладки ПРИОР.)
-onCandidatesUpdated = function()
-	local root = getMyRoot()
+M.onCandidatesUpdated = function()
+	local root = M.getMyRoot()
 	if not root then return end
 	local pos = root.Position
 	local radius = state.farmRadius
 	local present = {}
 	local changed = false
-	for _, c in ipairs(candidates) do
+	for _, c in ipairs(M.candidates) do
 		if (c.root.Position - pos).Magnitude <= radius then
 			present[c.key] = true
-			if not seenNames[c.key] then
-				seenNames[c.key] = c.name
+			if not M.seenNames[c.key] then
+				M.seenNames[c.key] = c.name
 				changed = true
 			end
 		end
 	end
-	presentNow = present
-	if changed then queueSave() end
+	M.presentNow = present
+	if changed then M.queueSave() end
+end
+
+-- боссы с особым маршрутом (имя ищется по части, без учёта регистра)
+M.BOSS_GUARDIAN = { corner = true, name = "The Undying Guardian" }
+M.BOSS_KNIGHT = { corner = false, name = "The Spooky Knight" }
+
+function M.bossSpec(c)
+	if not c then return nil end
+	local k = c.key
+	if state.bossGuardian and k:find("undying guardian", 1, true) then
+		return M.BOSS_GUARDIAN
+	end
+	if state.bossKnight and k:find("spooky knight", 1, true) then
+		return M.BOSS_KNIGHT
+	end
+	return nil
 end
 
 -- уровень приоритета цели (0 — обычная). Действует только в радиусе farmRadius
-local function priorityLevel(c, d)
+function M.priorityLevel(c, d)
+	if state.bossAutoPriority and d <= state.farmRadius and M.bossSpec(c) then
+		return 100
+	end
 	if not state.priorityEnabled or d > state.farmRadius then
 		return 0
 	end
@@ -619,14 +669,14 @@ end
 
 -- выбор цели: сначала по уровню приоритета, при равенстве — ближайшая.
 -- дорогая проверка candAlive выполняется только для тех, кто мог бы стать лучшим
-local function findNearest(fromPos)
+function M.findNearest(fromPos)
 	local best, bestDist, bestLevel = nil, nil, -1
-	for _, c in ipairs(candidates) do
+	for _, c in ipairs(M.candidates) do
 		local root = c.root
-		if c.inst.Parent and root.Parent and not isBanned(c) then
+		if c.inst.Parent and root.Parent and not M.isBanned(c) then
 			local d = (root.Position - fromPos).Magnitude
-			local level = priorityLevel(c, d)
-			if (level > bestLevel or (level == bestLevel and d < bestDist)) and candAlive(c) then
+			local level = M.priorityLevel(c, d)
+			if (level > bestLevel or (level == bestLevel and d < bestDist)) and M.candAlive(c) then
 				best, bestDist, bestLevel = c, d, level
 			end
 		end
@@ -635,7 +685,7 @@ local function findNearest(fromPos)
 end
 
 -- зазор между краями меня и цели (по горизонтали)
-local function edgeGap(target, myRoot)
+function M.edgeGap(target, myRoot)
 	local o = target.root.Position - myRoot.Position
 	local flat = math.sqrt(o.X * o.X + o.Z * o.Z)
 	local myR = (myRoot.Size.X + myRoot.Size.Z) / 4
@@ -645,7 +695,7 @@ end
 ------------------------------------------------------------
 -- Фарм: нажатие GUI-кнопок, клавиши, клики
 ------------------------------------------------------------
-local function findPath(root, names)
+function M.findPath(root, names)
 	local cur = root
 	for _, n in ipairs(names) do
 		cur = cur and cur:FindFirstChild(n)
@@ -657,7 +707,7 @@ local function findPath(root, names)
 end
 
 -- имитация нажатия GUI-кнопки (firesignal + getconnections)
-local function fireButton(btn)
+function M.fireButton(btn)
 	if not btn then return false end
 	local ok = pcall(function()
 		for _, sig in ipairs({ btn.MouseButton1Click, btn.Activated, btn.MouseButton1Down }) do
@@ -672,25 +722,25 @@ local function fireButton(btn)
 	return ok
 end
 
-local function fireSkip()
-	return fireButton(findPath(player.PlayerGui, { "MainGui", "Panels", "Bossbar", "SkipButton" }))
+function M.fireSkip()
+	return M.fireButton(M.findPath(player.PlayerGui, { "MainGui", "Panels", "Bossbar", "SkipButton" }))
 end
 
-local function fireReady()
-	return fireButton(findPath(player.PlayerGui, { "HalloweenWaveHUD", "Results", "Bottom", "Ready" }))
+function M.fireReady()
+	return M.fireButton(M.findPath(player.PlayerGui, { "HalloweenWaveHUD", "Results", "Bottom", "Ready" }))
 end
 
-local VIM = nil
+M.VIM = nil
 pcall(function()
-	VIM = game:GetService("VirtualInputManager")
+	M.VIM = game:GetService("VirtualInputManager")
 end)
 
-local function pressKey(keyCode, vk)
-	if VIM then
+function M.pressKey(keyCode, vk)
+	if M.VIM then
 		local ok = pcall(function()
-			VIM:SendKeyEvent(true, keyCode, false, game)
+			M.VIM:SendKeyEvent(true, keyCode, false, game)
 			task.wait(0.08) -- удерживаем чуть дольше: короткие нажатия игра иногда не замечает
-			VIM:SendKeyEvent(false, keyCode, false, game)
+			M.VIM:SendKeyEvent(false, keyCode, false, game)
 		end)
 		if ok then return end
 	end
@@ -703,27 +753,27 @@ local function pressKey(keyCode, vk)
 	end
 end
 
-local function isCharAlive()
-	local hum = getMyHumanoid()
+function M.isCharAlive()
+	local hum = M.getMyHumanoid()
 	return hum ~= nil and hum.Health > 0
 end
 
-local function hasToolEquipped()
+function M.hasToolEquipped()
 	local char = player.Character
 	return char ~= nil and char:FindFirstChildOfClass("Tool") ~= nil
 end
 
 -- клик в центр экрана
-local function clickCenter()
+function M.clickCenter()
 	local camera = workspace.CurrentCamera
 	if not camera then return end
 	local vp = camera.ViewportSize
 	local x, y = vp.X / 2, vp.Y / 2
 
-	if VIM then
+	if M.VIM then
 		local ok = pcall(function()
-			VIM:SendMouseButtonEvent(x, y, 0, true, game, 0)
-			VIM:SendMouseButtonEvent(x, y, 0, false, game, 0)
+			M.VIM:SendMouseButtonEvent(x, y, 0, true, game, 0)
+			M.VIM:SendMouseButtonEvent(x, y, 0, false, game, 0)
 		end)
 		if ok then return end
 	end
@@ -738,11 +788,11 @@ local function clickCenter()
 end
 
 -- один клик в произвольную точку экрана (пиксели)
-local function clickAt(x, y)
-	if VIM then
+function M.clickAt(x, y)
+	if M.VIM then
 		local ok = pcall(function()
-			VIM:SendMouseButtonEvent(x, y, 0, true, game, 0)
-			VIM:SendMouseButtonEvent(x, y, 0, false, game, 0)
+			M.VIM:SendMouseButtonEvent(x, y, 0, true, game, 0)
+			M.VIM:SendMouseButtonEvent(x, y, 0, false, game, 0)
 		end)
 		if ok then return end
 	end
@@ -755,14 +805,14 @@ local function clickAt(x, y)
 end
 
 -- есть ли живые цели в радиусе farmRadius (сначала дешёвая проверка расстояния)
-local function hasTargetsInRadius(rootPos)
+function M.hasTargetsInRadius(rootPos)
 	local radius = state.farmRadius
-	for _, c in ipairs(candidates) do
+	for _, c in ipairs(M.candidates) do
 		local root = c.root
 		if c.inst.Parent and root.Parent
 			and (root.Position - rootPos).Magnitude <= radius
-			and not isBanned(c)
-			and candAlive(c) then
+			and not M.isBanned(c)
+			and M.candAlive(c) then
 			return true
 		end
 	end
@@ -772,12 +822,12 @@ end
 ------------------------------------------------------------
 -- Режим СБРОСА: ресет персонажа (убить и возродить)
 ------------------------------------------------------------
-local resetBusy = false
-local goneCount = 0       -- сколько раз пропадали все цели с прошлого цикла
-local cyclesDone = 0      -- сколько циклов сброса запущено
-local refreshResetInfo = nil -- назначается позже (обновляет строку состояния в меню)
+M.resetBusy = false
+M.goneCount = 0       -- сколько раз пропадали все цели с прошлого цикла
+M.cyclesDone = 0      -- сколько циклов сброса запущено
+M.refreshResetInfo = nil -- назначается позже (обновляет строку состояния в меню)
 
-local function resetCharacter()
+function M.resetCharacter()
 	local char = player.Character
 	local hum = char and char:FindFirstChildOfClass("Humanoid")
 	if not hum then return false end
@@ -787,63 +837,63 @@ local function resetCharacter()
 end
 
 -- цикл: первый ресет сразу, второй через state.resetDelay секунд
-local function runResetCycle()
-	if resetBusy or not state.alive then return end
-	resetBusy = true
-	cyclesDone += 1
-	if refreshResetInfo then refreshResetInfo() end
+function M.runResetCycle()
+	if M.resetBusy or not state.alive then return end
+	M.resetBusy = true
+	M.cyclesDone += 1
+	if M.refreshResetInfo then M.refreshResetInfo() end
 	task.spawn(function()
-		resetCharacter() -- первый ресет
+		M.resetCharacter() -- первый ресет
 		local t0 = os.clock()
 		while state.alive and os.clock() - t0 < state.resetDelay do
 			task.wait(0.1)
 		end
 		if state.alive then
-			resetCharacter() -- второй ресет
+			M.resetCharacter() -- второй ресет
 		end
-		resetBusy = false
-		if refreshResetInfo then refreshResetInfo() end
+		M.resetBusy = false
+		if M.refreshResetInfo then M.refreshResetInfo() end
 	end)
 end
 
 -- вызывается один раз при каждом «пропадании всех целей»
-local function onTargetsGone()
+function M.onTargetsGone()
 	if not state.resetEnabled then return end
-	goneCount += 1
-	if goneCount >= state.resetEvery then
-		goneCount = 0
-		runResetCycle()
+	M.goneCount += 1
+	if M.goneCount >= state.resetEvery then
+		M.goneCount = 0
+		M.runResetCycle()
 	end
-	if refreshResetInfo then refreshResetInfo() end
+	if M.refreshResetInfo then M.refreshResetInfo() end
 end
 
 ------------------------------------------------------------
 -- Фарм: действия после смерти
 ------------------------------------------------------------
-local deathToken = 0
-local diedConn = nil
+M.deathToken = 0
+M.diedConn = nil
 
-local function onDeath()
+function M.onDeath()
 	if not state.alive or not state.farm then return end
-	deathToken += 1
-	local token = deathToken
+	M.deathToken += 1
+	local token = M.deathToken
 	local function active()
-		return state.alive and state.farm and token == deathToken
+		return state.alive and state.farm and token == M.deathToken
 	end
 
 	-- клик в выбранную точку: через DEATH_CLICK_DELAY сек, DEATH_CLICK_COUNT нажатий с паузой
 	if state.deathClick then
 		task.spawn(function()
-			task.wait(DEATH_CLICK_DELAY)
-			for i = 1, DEATH_CLICK_COUNT do
+			task.wait(M.DEATH_CLICK_DELAY)
+			for i = 1, M.DEATH_CLICK_COUNT do
 				if not active() then return end
 				local camera = workspace.CurrentCamera
 				if camera then
 					local vp = camera.ViewportSize
-					clickAt(state.clickX * vp.X, state.clickY * vp.Y)
+					M.clickAt(state.clickX * vp.X, state.clickY * vp.Y)
 				end
-				if i < DEATH_CLICK_COUNT then
-					task.wait(DEATH_CLICK_GAP)
+				if i < M.DEATH_CLICK_COUNT then
+					task.wait(M.DEATH_CLICK_GAP)
 				end
 			end
 		end)
@@ -852,12 +902,12 @@ local function onDeath()
 	-- кнопка Ready: раз в секунду, 10 секунд
 	if state.deathReady then
 		task.spawn(function()
-			local count = math.floor(DEATH_READY_DURATION / DEATH_READY_INTERVAL)
+			local count = math.floor(M.DEATH_READY_DURATION / M.DEATH_READY_INTERVAL)
 			for i = 1, count do
 				if not active() then return end
-				fireReady()
+				M.fireReady()
 				if i < count then
-					task.wait(DEATH_READY_INTERVAL)
+					task.wait(M.DEATH_READY_INTERVAL)
 				end
 			end
 		end)
@@ -867,22 +917,22 @@ local function onDeath()
 	-- Нажимаем только когда персонаж жив; если инструмент не взялся в руки — до 3 попыток.
 	if state.deathKeys then
 		task.spawn(function()
-			local cycles = math.floor(DEATH_KEYS_DURATION / DEATH_KEYS_INTERVAL)
+			local cycles = math.floor(M.DEATH_KEYS_DURATION / M.DEATH_KEYS_INTERVAL)
 			local t0 = os.clock()
 			for i = 1, cycles do
-				local waitFor = t0 + (i - 1) * DEATH_KEYS_INTERVAL - os.clock()
+				local waitFor = t0 + (i - 1) * M.DEATH_KEYS_INTERVAL - os.clock()
 				if waitFor > 0 then
 					task.wait(waitFor)
 				end
 				if not active() then return end
-				if isCharAlive() then
+				if M.isCharAlive() then
 					for attempt = 1, 3 do
-						pressKey(Enum.KeyCode.Two, 0x32)
-						task.wait(KEYS_GAP)
+						M.pressKey(Enum.KeyCode.Two, 0x32)
+						task.wait(M.KEYS_GAP)
 						if not active() then return end
-						pressKey(Enum.KeyCode.One, 0x31)
+						M.pressKey(Enum.KeyCode.One, 0x31)
 						task.wait(0.25)
-						if hasToolEquipped() or not isCharAlive() or not active() then
+						if M.hasToolEquipped() or not M.isCharAlive() or not active() then
 							break
 						end
 					end
@@ -892,27 +942,27 @@ local function onDeath()
 	end
 end
 
-local function hookCharacter(char)
-	if diedConn then
-		diedConn:Disconnect()
-		diedConn = nil
+function M.hookCharacter(char)
+	if M.diedConn then
+		M.diedConn:Disconnect()
+		M.diedConn = nil
 	end
 	local hum = char:WaitForChild("Humanoid", 10)
 	if hum and state.alive then
-		diedConn = hum.Died:Connect(onDeath)
+		M.diedConn = hum.Died:Connect(M.onDeath)
 	end
 end
 
 ------------------------------------------------------------
 -- GUI: основа (цвета, окно, шапка, вкладки)
 ------------------------------------------------------------
-local guiParent = playerGui
+M.guiParent = playerGui
 do
 	local ok, hui = pcall(function() return gethui() end)
-	if ok and hui then guiParent = hui end
+	if ok and hui then M.guiParent = hui end
 end
 for _, name in ipairs({ "NPCWalkerGUI", "NPCWalkerMarker" }) do
-	for _, p in ipairs({ playerGui, guiParent }) do
+	for _, p in ipairs({ playerGui, M.guiParent }) do
 		local old = p:FindFirstChild(name)
 		if old then old:Destroy() end
 	end
@@ -931,33 +981,33 @@ local C = {
 	white = Color3.fromRGB(235, 235, 235),
 }
 
-local W = 268
-local HEADER_H = 42
-local TAB_H = 28
-local TOP_H = HEADER_H + TAB_H + 1
+M.W = 268
+M.HEADER_H = 42
+M.TAB_H = 28
+M.TOP_H = M.HEADER_H + M.TAB_H + 1
 
-local cam = workspace.CurrentCamera
-local viewH = cam and cam.ViewportSize.Y or 600
-local FULL_H = math.clamp(viewH - 60, 240, 360)
+M.cam = workspace.CurrentCamera
+M.viewH = M.cam and M.cam.ViewportSize.Y or 600
+M.FULL_H = math.clamp(M.viewH - 60, 240, 360)
 
-local gui = Instance.new("ScreenGui")
-gui.Name = "NPCWalkerGUI"
-gui.ResetOnSpawn = false
-gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
-gui.DisplayOrder = 999
-gui.Parent = guiParent
+M.gui = Instance.new("ScreenGui")
+M.gui.Name = "NPCWalkerGUI"
+M.gui.ResetOnSpawn = false
+M.gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+M.gui.DisplayOrder = 999
+M.gui.Parent = M.guiParent
 
-local main = Instance.new("Frame")
-main.Name = "Main"
-main.Size = UDim2.fromOffset(W, FULL_H)
-main.Position = UDim2.new(0, 10, 0, 8)
-main.BackgroundColor3 = C.bg
-main.BorderSizePixel = 0
-main.ClipsDescendants = true
-main.Parent = gui
-Instance.new("UICorner", main).CornerRadius = UDim.new(0, 12)
+M.main = Instance.new("Frame")
+M.main.Name = "Main"
+M.main.Size = UDim2.fromOffset(M.W, M.FULL_H)
+M.main.Position = UDim2.new(0, 10, 0, 8)
+M.main.BackgroundColor3 = C.bg
+M.main.BorderSizePixel = 0
+M.main.ClipsDescendants = true
+M.main.Parent = M.gui
+Instance.new("UICorner", M.main).CornerRadius = UDim.new(0, 12)
 do
-	local stroke = Instance.new("UIStroke", main)
+	local stroke = Instance.new("UIStroke", M.main)
 	stroke.Color = C.line
 	stroke.Thickness = 1
 end
@@ -994,17 +1044,17 @@ local function makeButton(parent, text, bg, fg, size, bucket)
 end
 
 -- Логотип: сначала rbxassetid, если не загрузился — миниатюра ассета
-local function applyIcon(img)
-	img.Image = "rbxassetid://" .. LOGO_ID
+function M.applyIcon(img)
+	img.Image = "rbxassetid://" .. M.LOGO_ID
 	task.delay(4, function()
 		if img.Parent and not img.IsLoaded then
-			img.Image = ("rbxthumb://type=Asset&id=%d&w=150&h=150"):format(LOGO_ID)
+			img.Image = ("rbxthumb://type=Asset&id=%d&w=150&h=150"):format(M.LOGO_ID)
 		end
 	end)
 end
 
 -- Перетаскивание (мышь и палец). onTap вызывается, если это было нажатие без сдвига.
-local function makeDraggable(handle, target, onTap)
+function M.makeDraggable(handle, target, onTap)
 	local dragging, dragInput, dragStart, startPos, moved = false, nil, nil, nil, false
 	track(handle.InputBegan:Connect(function(input)
 		if input.UserInputType == Enum.UserInputType.Touch
@@ -1042,92 +1092,92 @@ local function makeDraggable(handle, target, onTap)
 end
 
 -- Шапка
-local header = Instance.new("Frame")
-header.Name = "Header"
-header.Size = UDim2.new(1, 0, 0, HEADER_H)
-header.BackgroundTransparency = 1
-header.Parent = main
+M.header = Instance.new("Frame")
+M.header.Name = "Header"
+M.header.Size = UDim2.new(1, 0, 0, M.HEADER_H)
+M.header.BackgroundTransparency = 1
+M.header.Parent = M.main
 
-local logo = Instance.new("ImageLabel")
-logo.Size = UDim2.fromOffset(28, 28)
-logo.Position = UDim2.fromOffset(10, (HEADER_H - 28) / 2)
-logo.BackgroundColor3 = C.card
-logo.BorderSizePixel = 0
-logo.ScaleType = Enum.ScaleType.Fit
-logo.Parent = header
-Instance.new("UICorner", logo).CornerRadius = UDim.new(0, 7)
-applyIcon(logo)
+M.logo = Instance.new("ImageLabel")
+M.logo.Size = UDim2.fromOffset(28, 28)
+M.logo.Position = UDim2.fromOffset(10, (M.HEADER_H - 28) / 2)
+M.logo.BackgroundColor3 = C.card
+M.logo.BorderSizePixel = 0
+M.logo.ScaleType = Enum.ScaleType.Fit
+M.logo.Parent = M.header
+Instance.new("UICorner", M.logo).CornerRadius = UDim.new(0, 7)
+M.applyIcon(M.logo)
 
-local titleLabel = Instance.new("TextLabel")
-titleLabel.BackgroundTransparency = 1
-titleLabel.Position = UDim2.fromOffset(46, 6)
-titleLabel.Size = UDim2.fromOffset(92, 16)
-titleLabel.Font = Enum.Font.GothamBold
-titleLabel.TextSize = 13
-titleLabel.TextColor3 = C.text
-titleLabel.TextXAlignment = Enum.TextXAlignment.Left
-titleLabel.Text = "WEB VALLEY"
-titleLabel.Parent = header
+M.titleLabel = Instance.new("TextLabel")
+M.titleLabel.BackgroundTransparency = 1
+M.titleLabel.Position = UDim2.fromOffset(46, 6)
+M.titleLabel.Size = UDim2.fromOffset(92, 16)
+M.titleLabel.Font = Enum.Font.GothamBold
+M.titleLabel.TextSize = 13
+M.titleLabel.TextColor3 = C.text
+M.titleLabel.TextXAlignment = Enum.TextXAlignment.Left
+M.titleLabel.Text = "WEB VALLEY"
+M.titleLabel.Parent = M.header
 
-local subtitleLabel = Instance.new("TextLabel")
-subtitleLabel.BackgroundTransparency = 1
-subtitleLabel.Position = UDim2.fromOffset(46, 23)
-subtitleLabel.Size = UDim2.fromOffset(100, 12)
-subtitleLabel.Font = Enum.Font.GothamMedium
-subtitleLabel.TextSize = 9
-subtitleLabel.TextColor3 = C.yellow
-subtitleLabel.TextXAlignment = Enum.TextXAlignment.Left
-subtitleLabel.Text = "STUDIO · NPC WALKER"
-subtitleLabel.Parent = header
+M.subtitleLabel = Instance.new("TextLabel")
+M.subtitleLabel.BackgroundTransparency = 1
+M.subtitleLabel.Position = UDim2.fromOffset(46, 23)
+M.subtitleLabel.Size = UDim2.fromOffset(100, 12)
+M.subtitleLabel.Font = Enum.Font.GothamMedium
+M.subtitleLabel.TextSize = 9
+M.subtitleLabel.TextColor3 = C.yellow
+M.subtitleLabel.TextXAlignment = Enum.TextXAlignment.Left
+M.subtitleLabel.Text = "STUDIO · NPC WALKER"
+M.subtitleLabel.Parent = M.header
 
-local fpsLabel = Instance.new("TextLabel")
-fpsLabel.BackgroundTransparency = 1
-fpsLabel.AnchorPoint = Vector2.new(1, 0.5)
-fpsLabel.Position = UDim2.new(1, -72, 0.5, 0)
-fpsLabel.Size = UDim2.fromOffset(46, 16)
-fpsLabel.Font = Enum.Font.GothamMedium
-fpsLabel.TextSize = 11
-fpsLabel.TextColor3 = C.sub
-fpsLabel.TextXAlignment = Enum.TextXAlignment.Right
-fpsLabel.Text = "-- FPS"
-fpsLabel.Parent = header
+M.fpsLabel = Instance.new("TextLabel")
+M.fpsLabel.BackgroundTransparency = 1
+M.fpsLabel.AnchorPoint = Vector2.new(1, 0.5)
+M.fpsLabel.Position = UDim2.new(1, -72, 0.5, 0)
+M.fpsLabel.Size = UDim2.fromOffset(46, 16)
+M.fpsLabel.Font = Enum.Font.GothamMedium
+M.fpsLabel.TextSize = 11
+M.fpsLabel.TextColor3 = C.sub
+M.fpsLabel.TextXAlignment = Enum.TextXAlignment.Right
+M.fpsLabel.Text = "-- FPS"
+M.fpsLabel.Parent = M.header
 
-local minBtn = makeButton(header, "—", C.btn, C.text, UDim2.fromOffset(26, 26))
-minBtn.AnchorPoint = Vector2.new(1, 0.5)
-minBtn.Position = UDim2.new(1, -8, 0.5, 0)
+M.minBtn = makeButton(M.header, "—", C.btn, C.text, UDim2.fromOffset(26, 26))
+M.minBtn.AnchorPoint = Vector2.new(1, 0.5)
+M.minBtn.Position = UDim2.new(1, -8, 0.5, 0)
 
-local hdrOffBtn = makeButton(header, "⏻", C.btn, C.yellow, UDim2.fromOffset(26, 26))
-hdrOffBtn.AnchorPoint = Vector2.new(1, 0.5)
-hdrOffBtn.Position = UDim2.new(1, -38, 0.5, 0)
+M.hdrOffBtn = makeButton(M.header, "⏻", C.btn, C.yellow, UDim2.fromOffset(26, 26))
+M.hdrOffBtn.AnchorPoint = Vector2.new(1, 0.5)
+M.hdrOffBtn.Position = UDim2.new(1, -38, 0.5, 0)
 
-local headerLine = Instance.new("Frame")
-headerLine.Size = UDim2.new(1, 0, 0, 1)
-headerLine.Position = UDim2.fromOffset(0, HEADER_H)
-headerLine.BackgroundColor3 = C.line
-headerLine.BorderSizePixel = 0
-headerLine.Parent = main
+M.headerLine = Instance.new("Frame")
+M.headerLine.Size = UDim2.new(1, 0, 0, 1)
+M.headerLine.Position = UDim2.fromOffset(0, M.HEADER_H)
+M.headerLine.BackgroundColor3 = C.line
+M.headerLine.BorderSizePixel = 0
+M.headerLine.Parent = M.main
 
 -- Полоса вкладок
-local tabBar = Instance.new("Frame")
-tabBar.Position = UDim2.fromOffset(0, HEADER_H + 1)
-tabBar.Size = UDim2.new(1, 0, 0, TAB_H)
-tabBar.BackgroundTransparency = 1
-tabBar.Parent = main
+M.tabBar = Instance.new("Frame")
+M.tabBar.Position = UDim2.fromOffset(0, M.HEADER_H + 1)
+M.tabBar.Size = UDim2.new(1, 0, 0, M.TAB_H)
+M.tabBar.BackgroundTransparency = 1
+M.tabBar.Parent = M.main
 
 -- Страницы (каждая — прокручиваемый список)
-local function newPage()
+function M.newPage()
 	local sf = Instance.new("ScrollingFrame")
 	sf.BackgroundTransparency = 1
 	sf.BorderSizePixel = 0
-	sf.Position = UDim2.fromOffset(0, TOP_H)
-	sf.Size = UDim2.new(1, 0, 1, -TOP_H)
+	sf.Position = UDim2.fromOffset(0, M.TOP_H)
+	sf.Size = UDim2.new(1, 0, 1, -M.TOP_H)
 	sf.CanvasSize = UDim2.new(0, 0, 0, 0)
 	sf.AutomaticCanvasSize = Enum.AutomaticSize.Y
 	sf.ScrollBarThickness = 3
 	sf.ScrollBarImageColor3 = C.yellow
 	sf.ScrollingDirection = Enum.ScrollingDirection.Y
 	sf.Visible = false
-	sf.Parent = main
+	sf.Parent = M.main
 	local pad = Instance.new("UIPadding", sf)
 	pad.PaddingTop = UDim.new(0, 8)
 	pad.PaddingBottom = UDim.new(0, 8)
@@ -1139,39 +1189,39 @@ local function newPage()
 	return { frame = sf, n = 0 }
 end
 
-local function nextOrder(page)
+function M.nextOrder(page)
 	page.n += 1
 	return page.n
 end
 
-local pageMain = newPage()
-local pageMove = newPage()
-local pageFarm = newPage()
-local pagePrio = newPage()
-local pageReset = newPage()
-local pages = { pageMain, pageMove, pageFarm, pagePrio, pageReset }
-local tabNames = { "ГЛАВНАЯ", "ДВИЖ.", "ФАРМ", "ПРИОР.", "СБРОС" }
-local tabBtns, tabLines = {}, {}
+M.pageMain = M.newPage()
+M.pageMove = M.newPage()
+M.pageFarm = M.newPage()
+M.pagePrio = M.newPage()
+M.pageReset = M.newPage()
+M.pages = { M.pageMain, M.pageMove, M.pageFarm, M.pagePrio, M.pageReset }
+M.tabNames = { "ГЛАВНАЯ", "ДВИЖ.", "ФАРМ", "ПРИОР.", "СБРОС" }
+M.tabBtns, M.tabLines = {}, {}
 
-local function selectTab(index)
-	for i, p in ipairs(pages) do
+function M.selectTab(index)
+	for i, p in ipairs(M.pages) do
 		p.frame.Visible = (i == index)
-		tabBtns[i].TextColor3 = (i == index) and C.yellow or C.sub
-		tabLines[i].Visible = (i == index)
+		M.tabBtns[i].TextColor3 = (i == index) and C.yellow or C.sub
+		M.tabLines[i].Visible = (i == index)
 	end
 end
 
-for i, name in ipairs(tabNames) do
+for i, name in ipairs(M.tabNames) do
 	local b = Instance.new("TextButton")
 	b.AutoButtonColor = false
 	b.BackgroundTransparency = 1
-	b.Size = UDim2.new(1 / #tabNames, 0, 1, 0)
-	b.Position = UDim2.new((i - 1) / #tabNames, 0, 0, 0)
+	b.Size = UDim2.new(1 / #M.tabNames, 0, 1, 0)
+	b.Position = UDim2.new((i - 1) / #M.tabNames, 0, 0, 0)
 	b.Font = Enum.Font.GothamBold
 	b.TextSize = 10
 	b.TextColor3 = C.sub
 	b.Text = name
-	b.Parent = tabBar
+	b.Parent = M.tabBar
 	local ln = Instance.new("Frame")
 	ln.AnchorPoint = Vector2.new(0.5, 1)
 	ln.Position = UDim2.new(0.5, 0, 1, 0)
@@ -1180,61 +1230,61 @@ for i, name in ipairs(tabNames) do
 	ln.BorderSizePixel = 0
 	ln.Visible = false
 	ln.Parent = b
-	tabBtns[i] = b
-	tabLines[i] = ln
+	M.tabBtns[i] = b
+	M.tabLines[i] = ln
 	track(b.Activated:Connect(function()
-		selectTab(i)
-		if pages[i] == pagePrio and refreshPriorityList then
-			refreshPriorityList()
+		M.selectTab(i)
+		if M.pages[i] == M.pagePrio and M.refreshPriorityList then
+			M.refreshPriorityList()
 		end
 	end))
 end
 
 -- Сворачивание в плавающую иконку
-local iconFrame = Instance.new("Frame")
-iconFrame.Size = UDim2.fromOffset(46, 46)
-iconFrame.Position = main.Position
-iconFrame.BackgroundColor3 = C.bg
-iconFrame.BorderSizePixel = 0
-iconFrame.Visible = false
-iconFrame.Parent = gui
-Instance.new("UICorner", iconFrame).CornerRadius = UDim.new(0, 12)
+M.iconFrame = Instance.new("Frame")
+M.iconFrame.Size = UDim2.fromOffset(46, 46)
+M.iconFrame.Position = M.main.Position
+M.iconFrame.BackgroundColor3 = C.bg
+M.iconFrame.BorderSizePixel = 0
+M.iconFrame.Visible = false
+M.iconFrame.Parent = M.gui
+Instance.new("UICorner", M.iconFrame).CornerRadius = UDim.new(0, 12)
 do
-	local s = Instance.new("UIStroke", iconFrame)
+	local s = Instance.new("UIStroke", M.iconFrame)
 	s.Color = C.yellow
 	s.Thickness = 1.5
 end
-local iconImg = Instance.new("ImageLabel")
-iconImg.AnchorPoint = Vector2.new(0.5, 0.5)
-iconImg.Position = UDim2.new(0.5, 0, 0.5, 0)
-iconImg.Size = UDim2.new(1, -10, 1, -10)
-iconImg.BackgroundTransparency = 1
-iconImg.ScaleType = Enum.ScaleType.Fit
-iconImg.Parent = iconFrame
-Instance.new("UICorner", iconImg).CornerRadius = UDim.new(0, 8)
-applyIcon(iconImg)
+M.iconImg = Instance.new("ImageLabel")
+M.iconImg.AnchorPoint = Vector2.new(0.5, 0.5)
+M.iconImg.Position = UDim2.new(0.5, 0, 0.5, 0)
+M.iconImg.Size = UDim2.new(1, -10, 1, -10)
+M.iconImg.BackgroundTransparency = 1
+M.iconImg.ScaleType = Enum.ScaleType.Fit
+M.iconImg.Parent = M.iconFrame
+Instance.new("UICorner", M.iconImg).CornerRadius = UDim.new(0, 8)
+M.applyIcon(M.iconImg)
 
-local function setMinimized(v)
+function M.setMinimized(v)
 	if v then
-		iconFrame.Position = main.Position
-		main.Visible = false
-		iconFrame.Visible = true
+		M.iconFrame.Position = M.main.Position
+		M.main.Visible = false
+		M.iconFrame.Visible = true
 	else
-		main.Position = iconFrame.Position
-		iconFrame.Visible = false
-		main.Visible = true
+		M.main.Position = M.iconFrame.Position
+		M.iconFrame.Visible = false
+		M.main.Visible = true
 	end
 end
 
-makeDraggable(header, main, nil)
-makeDraggable(iconFrame, iconFrame, function()
-	setMinimized(false)
+M.makeDraggable(M.header, M.main, nil)
+M.makeDraggable(M.iconFrame, M.iconFrame, function()
+	M.setMinimized(false)
 end)
 
 ------------------------------------------------------------
 -- GUI: конструкторы строк (раздел, переключатель, шаг, кнопка)
 ------------------------------------------------------------
-local function addSection(page, text)
+function M.addSection(page, text)
 	local l = Instance.new("TextLabel")
 	l.BackgroundTransparency = 1
 	l.Size = UDim2.new(1, 0, 0, 16)
@@ -1243,12 +1293,12 @@ local function addSection(page, text)
 	l.TextColor3 = C.yellow
 	l.TextXAlignment = Enum.TextXAlignment.Left
 	l.Text = text
-	l.LayoutOrder = nextOrder(page)
+	l.LayoutOrder = M.nextOrder(page)
 	l.Parent = page.frame
 	return l
 end
 
-local function addNote(page, text, height)
+function M.addNote(page, text, height)
 	local l = Instance.new("TextLabel")
 	l.BackgroundTransparency = 1
 	l.Size = UDim2.new(1, 0, 0, height or 28)
@@ -1259,19 +1309,19 @@ local function addNote(page, text, height)
 	l.TextYAlignment = Enum.TextYAlignment.Top
 	l.TextWrapped = true
 	l.Text = text
-	l.LayoutOrder = nextOrder(page)
+	l.LayoutOrder = M.nextOrder(page)
 	l.Parent = page.frame
 	return l
 end
 
-local function addToggle(page, text, get, set)
+function M.addToggle(page, text, get, set)
 	local row = Instance.new("TextButton")
 	row.AutoButtonColor = false
 	row.Text = ""
 	row.Size = UDim2.new(1, 0, 0, 32)
 	row.BackgroundColor3 = C.card
 	row.BorderSizePixel = 0
-	row.LayoutOrder = nextOrder(page)
+	row.LayoutOrder = M.nextOrder(page)
 	row.Parent = page.frame
 	Instance.new("UICorner", row).CornerRadius = UDim.new(0, 8)
 
@@ -1326,12 +1376,12 @@ end
 
 -- числовая строка: подпись + поле, куда можно вписать значение вручную + кнопки − / +
 -- spec = { get = fn, set = fn(v), step = число | fn(dir, текущее), min, max, dec = знаков после запятой }
-local function addNumber(page, label, spec)
+function M.addNumber(page, label, spec)
 	local row = Instance.new("Frame")
 	row.Size = UDim2.new(1, 0, 0, 32)
 	row.BackgroundColor3 = C.card
 	row.BorderSizePixel = 0
-	row.LayoutOrder = nextOrder(page)
+	row.LayoutOrder = M.nextOrder(page)
 	row.Parent = page.frame
 	Instance.new("UICorner", row).CornerRadius = UDim.new(0, 8)
 
@@ -1412,9 +1462,9 @@ local function addNumber(page, label, spec)
 	return { refresh = refresh }
 end
 
-local function addButton(page, text, bg, fg, height, callback)
+function M.addButton(page, text, bg, fg, height, callback)
 	local b = makeButton(page.frame, text, bg, fg, UDim2.new(1, 0, 0, height))
-	b.LayoutOrder = nextOrder(page)
+	b.LayoutOrder = M.nextOrder(page)
 	if callback then
 		track(b.Activated:Connect(callback))
 	end
@@ -1424,69 +1474,69 @@ end
 ------------------------------------------------------------
 -- Элементы, которые нужны логике (объявляем заранее)
 ------------------------------------------------------------
-local statusLabel, infoLabel = nil, nil
-local startBtn, stopBtn, offBtn = nil, nil, nil
-local modeBtn, queryBox = nil, nil
-local lastStatus = nil
+M.statusLabel, M.infoLabel = nil, nil
+M.startBtn, M.stopBtn, M.offBtn = nil, nil, nil
+M.modeBtn, M.queryBox = nil, nil
+M.lastStatus = nil
 
-local function setStatus(text, color)
-	if lastStatus == text or not statusLabel then return end
-	lastStatus = text
-	statusLabel.Text = text
-	statusLabel.TextColor3 = color or C.text
+function M.setStatus(text, color)
+	if M.lastStatus == text or not M.statusLabel then return end
+	M.lastStatus = text
+	M.statusLabel.Text = text
+	M.statusLabel.TextColor3 = color or C.text
 end
 
-local function applyMode()
-	local m = MODES_BY_ID[state.mode]
-	modeBtn.Text = ("Режим поиска: %s  ›"):format(m.label)
-	queryBox.Visible = m.needsQuery
-	queryBox.PlaceholderText = m.placeholder or ""
-	queryBox.Text = state.queries[state.mode] or ""
-	requestRefresh()
+function M.applyMode()
+	local m = M.MODES_BY_ID[state.mode]
+	M.modeBtn.Text = ("Режим поиска: %s  ›"):format(m.label)
+	M.queryBox.Visible = m.needsQuery
+	M.queryBox.PlaceholderText = m.placeholder or ""
+	M.queryBox.Text = state.queries[state.mode] or ""
+	M.requestRefresh()
 end
 
 ------------------------------------------------------------
 -- ФАРМ: кнопка (пересоздаваемая), циклы и авто-сброс по FPS
 ------------------------------------------------------------
-local farmBtn = nil
-local farmOrder = 0
-local farmConns = {}        -- соединения именно кнопки фарма
-local farmGen = 0           -- «поколение» циклов: старые циклы сами завершаются
-local farmResetting = false
-local resetCount = 0
-local watchArmed = true     -- взведён ли счётчик «пропаданий целей» (цели были с прошлого раза)
+M.farmBtn = nil
+M.farmOrder = 0
+M.farmConns = {}        -- соединения именно кнопки фарма
+M.farmGen = 0           -- «поколение» циклов: старые циклы сами завершаются
+M.farmResetting = false
+M.resetCount = 0
+M.watchArmed = true     -- взведён ли счётчик «пропаданий целей» (цели были с прошлого раза)
 
-local function refreshFarmBtn()
-	if not farmBtn then return end
+function M.refreshFarmBtn()
+	if not M.farmBtn then return end
 	local on = state.farm
-	if farmResetting and on then
-		farmBtn.Text = "СБРОС ФАРМА..."
-		farmBtn.BackgroundColor3 = C.btn
-		farmBtn.TextColor3 = C.yellow
+	if M.farmResetting and on then
+		M.farmBtn.Text = "СБРОС ФАРМА..."
+		M.farmBtn.BackgroundColor3 = C.btn
+		M.farmBtn.TextColor3 = C.yellow
 		return
 	end
-	local suffix = (on and resetCount > 0) and ("  (сбросов: " .. resetCount .. ")") or ""
-	farmBtn.Text = (on and "ФАРМ: ВКЛ" or "ФАРМ: ВЫКЛ") .. suffix
-	farmBtn.TextColor3 = on and C.black or C.text
-	TweenService:Create(farmBtn, TweenInfo.new(0.12), {
+	local suffix = (on and M.resetCount > 0) and ("  (сбросов: " .. M.resetCount .. ")") or ""
+	M.farmBtn.Text = (on and "ФАРМ: ВКЛ" or "ФАРМ: ВЫКЛ") .. suffix
+	M.farmBtn.TextColor3 = on and C.black or C.text
+	TweenService:Create(M.farmBtn, TweenInfo.new(0.12), {
 		BackgroundColor3 = on and C.yellow or C.btn,
 	}):Play()
 end
 
-local function flashFarm(text)
-	if farmBtn then
-		farmBtn.Text = text
+function M.flashFarm(text)
+	if M.farmBtn then
+		M.farmBtn.Text = text
 	end
 	task.delay(0.8, function()
-		if state.alive then refreshFarmBtn() end
+		if state.alive then M.refreshFarmBtn() end
 	end)
 end
 
 -- цикл авто-кликера (постоянные клики)
-local function clickLoop(gen)
-	while state.alive and state.farm and gen == farmGen do
+function M.clickLoop(gen)
+	while state.alive and state.farm and gen == M.farmGen do
 		if state.autoClick then
-			clickCenter()
+			M.clickCenter()
 			task.wait(1 / math.max(1, state.clicksPerSec))
 		else
 			task.wait(0.2)
@@ -1495,33 +1545,33 @@ local function clickLoop(gen)
 end
 
 -- цикл слежения: пропадание всех целей -> скип и/или счётчик сброса
-local function watchLoop(gen)
+function M.watchLoop(gen)
 	local emptySince = nil
 	local lastSkip = 0
 	local firstSkip = false
-	while state.alive and state.farm and gen == farmGen do
-		if (state.autoSkip or state.resetEnabled) and candidatesReady and not searchNote then
-			local root = getMyRoot()
+	while state.alive and state.farm and gen == M.farmGen do
+		if (state.autoSkip or state.resetEnabled) and M.candidatesReady and not M.searchNote then
+			local root = M.getMyRoot()
 			if root then
-				if hasTargetsInRadius(root.Position) then
+				if M.hasTargetsInRadius(root.Position) then
 					emptySince = nil
-					watchArmed = true
+					M.watchArmed = true
 				else
 					local now = os.clock()
 					emptySince = emptySince or now
-					if now - emptySince >= EMPTY_DEBOUNCE then
-						if watchArmed then
-							watchArmed = false
+					if now - emptySince >= M.EMPTY_DEBOUNCE then
+						if M.watchArmed then
+							M.watchArmed = false
 							firstSkip = true
-							onTargetsGone() -- одно «пропадание всех целей»
+							M.onTargetsGone() -- одно «пропадание всех целей»
 						end
 						if state.autoSkip then
-							local due = firstSkip or (state.skipRepeat and now - lastSkip >= SKIP_COOLDOWN)
+							local due = firstSkip or (state.skipRepeat and now - lastSkip >= M.SKIP_COOLDOWN)
 							if due then
 								firstSkip = false
 								lastSkip = now
-								if fireSkip() then
-									flashFarm("Skip отправлен")
+								if M.fireSkip() then
+									M.flashFarm("Skip отправлен")
 								end
 							end
 						end
@@ -1535,51 +1585,51 @@ local function watchLoop(gen)
 	end
 end
 
-local function startFarmLoops()
-	farmGen += 1
-	local gen = farmGen
-	task.spawn(clickLoop, gen)
-	task.spawn(watchLoop, gen)
+function M.startFarmLoops()
+	M.farmGen += 1
+	local gen = M.farmGen
+	task.spawn(M.clickLoop, gen)
+	task.spawn(M.watchLoop, gen)
 end
 
-local function stopFarmLoops()
-	farmGen += 1
+function M.stopFarmLoops()
+	M.farmGen += 1
 end
 
-local function setFarm(on)
+function M.setFarm(on)
 	state.farm = on
 	if on then
-		startFarmLoops()
+		M.startFarmLoops()
 	else
-		stopFarmLoops()
-		deathToken += 1 -- прерываем действия после смерти
+		M.stopFarmLoops()
+		M.deathToken += 1 -- прерываем действия после смерти
 	end
-	refreshFarmBtn()
+	M.refreshFarmBtn()
 end
 
-local function destroyFarmButton()
-	for _, c in ipairs(farmConns) do
+function M.destroyFarmButton()
+	for _, c in ipairs(M.farmConns) do
 		pcall(function() c:Disconnect() end)
 	end
-	table.clear(farmConns)
-	if farmBtn then
-		farmBtn:Destroy()
-		farmBtn = nil
+	table.clear(M.farmConns)
+	if M.farmBtn then
+		M.farmBtn:Destroy()
+		M.farmBtn = nil
 	end
 end
 
-local function buildFarmButton()
-	destroyFarmButton()
-	farmBtn = makeButton(pageMain.frame, "", C.btn, C.text, UDim2.new(1, 0, 0, 38), farmConns)
-	farmBtn.LayoutOrder = farmOrder
-	farmConns[#farmConns + 1] = farmBtn.Activated:Connect(function()
-		setFarm(not state.farm)
+function M.buildFarmButton()
+	M.destroyFarmButton()
+	M.farmBtn = makeButton(M.pageMain.frame, "", C.btn, C.text, UDim2.new(1, 0, 0, 38), M.farmConns)
+	M.farmBtn.LayoutOrder = M.farmOrder
+	M.farmConns[#M.farmConns + 1] = M.farmBtn.Activated:Connect(function()
+		M.setFarm(not state.farm)
 	end)
-	refreshFarmBtn()
+	M.refreshFarmBtn()
 end
 
-local function rebuildHumanoidSet()
-	table.clear(npcHumanoids)
+function M.rebuildHumanoidSet()
+	table.clear(M.npcHumanoids)
 	local n = 0
 	for _, inst in ipairs(workspace:GetDescendants()) do
 		n += 1
@@ -1587,29 +1637,29 @@ local function rebuildHumanoidSet()
 			task.wait()
 			if not state.alive then return end
 		end
-		addHumanoid(inst)
+		M.addHumanoid(inst)
 	end
 end
 
 -- СБРОС ФАРМА: пересоздаём кнопку, циклы, списки целей, чистим память и продолжаем фарм
-local lastFarmReset = 0
-local function resetFarm()
-	if farmResetting or not state.alive or not state.farm then return end
-	farmResetting = true
-	lastFarmReset = os.clock()
+M.lastFarmReset = 0
+function M.resetFarm()
+	if M.farmResetting or not state.alive or not state.farm then return end
+	M.farmResetting = true
+	M.lastFarmReset = os.clock()
 	task.spawn(function()
-		stopFarmLoops()
-		buildFarmButton()
-		requestRefresh()
-		rebuildHumanoidSet()
+		M.stopFarmLoops()
+		M.buildFarmButton()
+		M.requestRefresh()
+		M.rebuildHumanoidSet()
 		pcall(collectgarbage, "collect")
-		task.wait(FARM_RESET_PAUSE)
-		resetCount += 1
-		farmResetting = false
+		task.wait(M.FARM_RESET_PAUSE)
+		M.resetCount += 1
+		M.farmResetting = false
 		if state.alive and state.farm then
-			startFarmLoops()
+			M.startFarmLoops()
 		end
-		refreshFarmBtn()
+		M.refreshFarmBtn()
 	end)
 end
 
@@ -1623,18 +1673,18 @@ do
 		local fps = frames / accum
 		frames, accum = 0, 0
 
-		fpsLabel.Text = ("%d FPS"):format(math.floor(fps + 0.5))
-		fpsLabel.TextColor3 = fps <= FPS_RESET_BELOW and C.yellow or C.sub
+		M.fpsLabel.Text = ("%d FPS"):format(math.floor(fps + 0.5))
+		M.fpsLabel.TextColor3 = fps <= M.FPS_RESET_BELOW and C.yellow or C.sub
 
-		if state.farm and state.autoReset and not farmResetting then
-			if fps <= FPS_RESET_BELOW then
+		if state.farm and state.autoReset and not M.farmResetting then
+			if fps <= M.FPS_RESET_BELOW then
 				lowSeconds += 1
 			else
 				lowSeconds = 0
 			end
-			if lowSeconds >= FPS_LOW_SECONDS and os.clock() - lastFarmReset >= FARM_RESET_COOLDOWN then
+			if lowSeconds >= M.FPS_LOW_SECONDS and os.clock() - M.lastFarmReset >= M.FARM_RESET_COOLDOWN then
 				lowSeconds = 0
-				resetFarm()
+				M.resetFarm()
 			end
 		else
 			lowSeconds = 0
@@ -1645,145 +1695,393 @@ end
 ------------------------------------------------------------
 -- Скольжение (LinearVelocity в горизонтальной плоскости)
 ------------------------------------------------------------
-local glideAttach = nil
-local glideLV = nil
-local glideVel = Vector3.zero
+M.glideAttach = nil
+M.glideLV = nil
+M.glideVel = Vector3.zero
 
-local function destroyGlide()
-	if glideLV then
-		glideLV:Destroy()
-		glideLV = nil
+function M.destroyGlide()
+	if M.glideLV then
+		M.glideLV:Destroy()
+		M.glideLV = nil
 	end
-	if glideAttach then
-		glideAttach:Destroy()
-		glideAttach = nil
+	if M.glideAttach then
+		M.glideAttach:Destroy()
+		M.glideAttach = nil
 	end
 end
 
-local function ensureGlide(root)
-	if glideLV and glideLV.Parent and glideAttach and glideAttach.Parent == root then
+function M.ensureGlide(root)
+	if M.glideLV and M.glideLV.Parent and M.glideAttach and M.glideAttach.Parent == root then
 		return
 	end
-	destroyGlide()
-	glideAttach = Instance.new("Attachment")
-	glideAttach.Name = "NPCWalkerAttachment"
-	glideAttach.Parent = root
+	M.destroyGlide()
+	M.glideAttach = Instance.new("Attachment")
+	M.glideAttach.Name = "NPCWalkerAttachment"
+	M.glideAttach.Parent = root
 
-	glideLV = Instance.new("LinearVelocity")
-	glideLV.Name = "NPCWalkerGlide"
-	glideLV.Attachment0 = glideAttach
-	glideLV.RelativeTo = Enum.ActuatorRelativeTo.World
-	glideLV.VelocityConstraintMode = Enum.VelocityConstraintMode.Plane
-	glideLV.PrimaryTangentAxis = Vector3.new(1, 0, 0)
-	glideLV.SecondaryTangentAxis = Vector3.new(0, 0, 1)
-	glideLV.PlaneVelocity = Vector2.new(0, 0)
-	glideLV.MaxForce = math.huge
-	glideLV.Parent = root
+	M.glideLV = Instance.new("LinearVelocity")
+	M.glideLV.Name = "NPCWalkerGlide"
+	M.glideLV.Attachment0 = M.glideAttach
+	M.glideLV.RelativeTo = Enum.ActuatorRelativeTo.World
+	M.glideLV.VelocityConstraintMode = Enum.VelocityConstraintMode.Plane
+	M.glideLV.PrimaryTangentAxis = Vector3.new(1, 0, 0)
+	M.glideLV.SecondaryTangentAxis = Vector3.new(0, 0, 1)
+	M.glideLV.PlaneVelocity = Vector2.new(0, 0)
+	M.glideLV.MaxForce = math.huge
+	M.glideLV.Parent = root
 end
 
-local function stopGlide()
-	glideVel = Vector3.zero
-	destroyGlide()
+function M.stopGlide()
+	M.glideVel = Vector3.zero
+	M.destroyGlide()
 end
 
-local function applyGlide(root, desired, dt)
-	local alpha = 1 - math.exp(-GLIDE_SMOOTH * dt)
-	glideVel = glideVel:Lerp(desired, alpha)
+function M.applyGlide(root, desired, dt)
+	local alpha = 1 - math.exp(-M.GLIDE_SMOOTH * dt)
+	M.glideVel = M.glideVel:Lerp(desired, alpha)
 
-	if desired.Magnitude < 0.01 and glideVel.Magnitude < 0.3 then
-		glideVel = Vector3.zero
-		if glideLV then
-			glideLV.Enabled = false
+	if desired.Magnitude < 0.01 and M.glideVel.Magnitude < 0.3 then
+		M.glideVel = Vector3.zero
+		if M.glideLV then
+			M.glideLV.Enabled = false
 		end
 		return
 	end
 
-	ensureGlide(root)
-	glideLV.Enabled = true
-	glideLV.PlaneVelocity = Vector2.new(glideVel.X, glideVel.Z)
+	M.ensureGlide(root)
+	M.glideLV.Enabled = true
+	M.glideLV.PlaneVelocity = Vector2.new(M.glideVel.X, M.glideVel.Z)
 end
 
-local function faceDirection(root, flat, dt)
+function M.faceDirection(root, flat, dt)
 	if flat.Magnitude < 0.1 then return end
 	local pos = root.Position
 	local goal = CFrame.lookAt(pos, pos + flat)
-	local alpha = 1 - math.exp(-FACE_SMOOTH * dt)
+	local alpha = 1 - math.exp(-M.FACE_SMOOTH * dt)
 	root.CFrame = root.CFrame:Lerp(goal, alpha)
 end
 
 ------------------------------------------------------------
 -- Движение
 ------------------------------------------------------------
-local BIND_NAME = "NPCWalkerMove"
-local currentTarget = nil
-local lastRetarget = 0
-local stuckTime = 0
-local isBound = false
-local retreating = false
+M.BIND_NAME = "NPCWalkerMove"
+M.currentTarget = nil
+M.lastRetarget = 0
+M.stuckTime = 0
+M.isBound = false
+M.retreating = false
 
-local zoneActive = false
-local zoneArmed = true
-local noTargetTime = 0
-local zoneRecoverTime = 0
-local lastChar = nil
+M.zoneActive = false
+M.zoneArmed = true
+M.noTargetTime = 0
+M.zoneRecoverTime = 0
+M.lastChar = nil
 
-local function setAutoRotate(value)
-	local hum = getMyHumanoid()
+function M.setAutoRotate(value)
+	local hum = M.getMyHumanoid()
 	if hum then
 		hum.AutoRotate = value
 	end
 end
 
-local function stopMoving()
-	local hum = getMyHumanoid()
+function M.stopMoving()
+	local hum = M.getMyHumanoid()
 	if hum then
 		hum:Move(Vector3.zero, false)
 	end
 end
 
-local function unbindMove()
-	if isBound then
-		isBound = false
-		pcall(function() RunService:UnbindFromRenderStep(BIND_NAME) end)
+function M.unbindMove()
+	if M.isBound then
+		M.isBound = false
+		pcall(function() RunService:UnbindFromRenderStep(M.BIND_NAME) end)
 	end
 end
 
-local function targetValid(t)
-	return t ~= nil and candAlive(t) and not isBanned(t)
+function M.targetValid(t)
+	return t ~= nil and M.candAlive(t) and not M.isBanned(t)
 end
 
 -- скорость при подходе: не выше glideSpeed, замедляемся рядом с целью
-local function approachSpeed(d)
-	return math.min(state.glideSpeed, math.max(d * GLIDE_K, GLIDE_MIN_SPEED))
+function M.approachSpeed(d)
+	return math.min(state.glideSpeed, math.max(d * M.GLIDE_K, M.GLIDE_MIN_SPEED))
 end
 
-local function checkStuck(hum, root, dt, cond)
+function M.checkStuck(hum, root, dt, cond)
 	if state.autoJump and cond then
 		local v = root.AssemblyLinearVelocity
 		local speed = Vector3.new(v.X, 0, v.Z).Magnitude
 		if speed < 1.5 then
-			stuckTime += dt
-			if stuckTime > 0.35 then
+			M.stuckTime += dt
+			if M.stuckTime > 0.35 then
 				hum.Jump = true
-				stuckTime = 0
+				M.stuckTime = 0
 			end
 		else
-			stuckTime = 0
+			M.stuckTime = 0
 		end
 	else
-		stuckTime = 0
+		M.stuckTime = 0
 	end
 end
 
-local ghostTarget, ghostSince, ghostSig, ghostPos = nil, 0, nil, nil -- страж «зависших» целей
+M.ghostTarget, M.ghostSince, M.ghostSig, M.ghostPos = nil, 0, nil, nil -- страж «у цели»
+M.watchTarget = nil                -- цель, за которой следят стражи
+M.progBestGap, M.progSince = nil, 0  -- страж прогресса приближения
+M.visFailCount, M.animFailCount, M.lastGuardCheck = 0, 0, 0
 
-local function resetLatches()
-	ghostTarget = nil
-	retreating = false
-	zoneActive = false
-	zoneArmed = true
-	noTargetTime = 0
-	zoneRecoverTime = 0
+-- маршрут босса
+M.bossTarget, M.bossPhase, M.bossPhaseSince, M.bossLimit = nil, nil, 0, 0 -- фаза: "approach" -> "hold"
+M.bossEngaged, M.bossCorner, M.bossCornerAt = false, nil, 0
+
+function M.resetLatches()
+	M.ghostTarget = nil
+	M.bossTarget, M.bossPhase, M.bossEngaged, M.bossCorner = nil, nil, false, nil
+	M.retreating = false
+	M.zoneActive = false
+	M.zoneArmed = true
+	M.noTargetTime = 0
+	M.zoneRecoverTime = 0
+end
+
+------------------------------------------------------------
+-- Защита от «призрачных» целей
+------------------------------------------------------------
+M.hookConns = {}
+M.hooked = setmetatable({}, { __mode = "k" })
+M.banLog = {}
+
+-- события смерти для цели, за которой идём
+function M.hookInst(inst, hum)
+	if M.hooked[inst] then return end
+	if #M.hookConns > 300 then
+		for _, c in ipairs(M.hookConns) do
+			pcall(function() c:Disconnect() end)
+		end
+		table.clear(M.hookConns)
+		table.clear(M.hooked)
+	end
+	M.hooked[inst] = true
+	local function add(conn)
+		M.hookConns[#M.hookConns + 1] = conn
+	end
+	add(inst.AncestryChanged:Connect(function()
+		if inst:IsDescendantOf(workspace) then
+			M.deadSet[inst] = nil -- вернулся на карту (пул) — снова живой
+		else
+			M.deadSet[inst] = os.clock()
+		end
+	end))
+	add(inst.Destroying:Connect(function()
+		M.deadSet[inst] = os.clock()
+	end))
+	if hum then
+		add(hum.Died:Connect(function()
+			M.deadSet[inst] = os.clock()
+		end))
+		add(hum.HealthChanged:Connect(function(h)
+			if h <= 0 then
+				M.deadSet[inst] = os.clock()
+			else
+				M.deadSet[inst] = nil
+			end
+		end))
+	end
+	for _, n in ipairs(M.HP_NAMES) do
+		add(inst:GetAttributeChangedSignal(n):Connect(function()
+			local a = inst:GetAttribute(n)
+			if type(a) == "number" then
+				M.deadSet[inst] = (a <= 0) and os.clock() or nil
+			end
+		end))
+	end
+end
+
+-- есть ли у модели хоть одна видимая часть
+function M.hasVisibleParts(inst)
+	if inst:IsA("BasePart") then
+		return inst.Transparency < 0.95
+	end
+	for _, d in ipairs(inst:GetDescendants()) do
+		if d:IsA("BasePart") and d.Name ~= "HumanoidRootPart" and d.Transparency < 0.95 then
+			return true
+		end
+	end
+	return false
+end
+
+-- проигрываются ли анимации: true / false, nil — если Animator не найден
+function M.animActive(inst)
+	local ok, res = pcall(function()
+		local animator = inst:FindFirstChildWhichIsA("Animator", true)
+		if not animator then return nil end
+		return #animator:GetPlayingAnimationTracks() > 0
+	end)
+	if ok then return res end
+	return nil
+end
+
+-- подробное описание цели (для диагностики)
+function M.describeTarget(c)
+	local lines = {}
+	local function add(text)
+		lines[#lines + 1] = text
+	end
+	pcall(function()
+		local inst = c.inst
+		add(("Имя: %s (%s)"):format(inst.Name, inst.ClassName))
+		add("Путь: " .. inst:GetFullName())
+		add("В workspace: " .. tostring(inst:IsDescendantOf(workspace)))
+		local hum = inst:FindFirstChildOfClass("Humanoid")
+		if hum then
+			add(("Humanoid: HP %.1f / %.1f, состояние %s"):format(hum.Health, hum.MaxHealth, tostring(hum:GetState())))
+		else
+			add("Humanoid: нет" .. (c.hum and " (был при поиске!)" or ""))
+		end
+		add("HP-данные: " .. tostring(M.hpSignature(inst)))
+		local attrs = {}
+		for k, v in pairs(inst:GetAttributes()) do
+			attrs[#attrs + 1] = k .. "=" .. tostring(v)
+		end
+		add("Атрибуты: " .. (#attrs > 0 and table.concat(attrs, ", ") or "нет"))
+		local kids = {}
+		for i, ch in ipairs(inst:GetChildren()) do
+			if i > 25 then
+				kids[#kids + 1] = "..."
+				break
+			end
+			kids[#kids + 1] = ch.Name .. ":" .. ch.ClassName
+		end
+		add("Дети: " .. table.concat(kids, ", "))
+		local r = c.root
+		add(("Root: %s, поз %s, Anchored=%s"):format(r.Name, tostring(r.Position), tostring(r.Anchored)))
+		add("Видимые части: " .. tostring(M.hasVisibleParts(inst)))
+		add("Анимации идут: " .. tostring(M.animActive(inst)))
+		add(("candAlive=%s, isAlive=%s, deadSet=%s, banned=%s"):format(
+			tostring(M.candAlive(c)), tostring(M.isAlive(inst)), tostring(M.deadSet[inst] ~= nil), tostring(M.isBanned(c))
+		))
+	end)
+	return table.concat(lines, "\n")
+end
+
+-- временно пропускаем цель и записываем причину + снимок
+function M.banTarget(target, reason)
+	M.blacklist[target.inst] = os.clock() + M.GHOST_BAN_SECONDS
+	table.insert(M.banLog, 1, { name = target.name, reason = reason, dump = M.describeTarget(target) })
+	if #M.banLog > 5 then
+		table.remove(M.banLog)
+	end
+	M.currentTarget = nil
+	M.ghostTarget = nil
+	M.watchTarget = nil
+	M.progBestGap = nil
+	M.setStatus(("Пропущена цель %s: %s"):format(target.name, reason), C.yellow)
+end
+
+-- быстрые проверки текущей цели; возвращает причину или nil
+function M.guardTarget(target, now)
+	local inst, troot = target.inst, target.root
+	if state.posCheck then
+		local pos = troot.Position
+		if pos ~= pos or pos.Y < workspace.FallenPartsDestroyHeight + 10 then
+			return "позиция цели вне карты"
+		end
+	end
+	if now - M.lastGuardCheck >= 0.5 then
+		M.lastGuardCheck = now
+		if state.visCheck then
+			if M.hasVisibleParts(inst) then
+				M.visFailCount = 0
+			else
+				M.visFailCount += 1
+				if M.visFailCount >= 3 then
+					return "у цели нет видимых частей"
+				end
+			end
+		end
+		if state.animCheck then
+			if M.animActive(inst) == false then
+				M.animFailCount += 1
+				if M.animFailCount >= 6 then
+					return "нет проигрываемых анимаций (3 с)"
+				end
+			else
+				M.animFailCount = 0
+			end
+		end
+	end
+	return nil
+end
+
+------------------------------------------------------------
+-- Маршрут боссов: геометрия зоны и скольжение к точке
+------------------------------------------------------------
+M.BOSS_APPROACH_BASE = 15  -- запас времени на «подойти к боссу» (плюс время пути)
+M.BOSS_HYST = 4            -- гистерезис «рядом с зоной» (студы)
+
+-- расстояние от точки до зоны (0 — внутри)
+function M.zoneDistance(p)
+	if M.pointInZone(p) then return 0 end
+	local best
+	for i = 1, #M.ZONE_POINTS do
+		local a = M.ZONE_POINTS[i]
+		local b = M.ZONE_POINTS[(i % #M.ZONE_POINTS) + 1]
+		local c = M.closestOnSegment(p, a, b)
+		local d = math.sqrt((c.X - p.X) ^ 2 + (c.Z - p.Z) ^ 2)
+		if not best or d < best then
+			best = d
+		end
+	end
+	return best
+end
+
+-- ближайшая к p точка внутри зоны
+function M.clampToZone(p)
+	if M.pointInZone(p) then
+		return Vector3.new(p.X, 0, p.Z)
+	end
+	return M.zoneGoalPoint(p)
+end
+
+function M.flatDist(a, b)
+	return math.sqrt((a.X - b.X) ^ 2 + (a.Z - b.Z) ^ 2)
+end
+
+-- самый дальний от цели угол зоны (индекс) и расстояние до него
+function M.farCornerIndex(tpos)
+	local bestI, bestD
+	for i, pt in ipairs(M.ZONE_POINTS) do
+		local d = M.flatDist(pt, tpos)
+		if not bestD or d > bestD then
+			bestI, bestD = i, d
+		end
+	end
+	return bestI, bestD
+end
+
+-- точка чуть внутри зоны у угла
+function M.cornerPoint(i)
+	local pt = M.ZONE_POINTS[i]
+	local flatPt = Vector3.new(pt.X, 0, pt.Z)
+	local toCenter = M.ZONE_CENTER - flatPt
+	if toCenter.Magnitude < 0.01 then return flatPt end
+	return flatPt + toCenter.Unit * math.min(M.ZONE_INSET + 0.5, toCenter.Magnitude)
+end
+
+-- плавно скользим к точке; возвращает true, если уже на месте
+function M.glideToPoint(hum, root, goal, dt)
+	local p = root.Position
+	local to = Vector3.new(goal.X - p.X, 0, goal.Z - p.Z)
+	local dist = to.Magnitude
+	if dist < 0.6 then
+		hum:Move(Vector3.zero, false)
+		M.applyGlide(root, Vector3.zero, dt)
+		return true
+	end
+	local dir = to.Unit
+	hum:Move(dir, false)
+	M.applyGlide(root, dir * M.approachSpeed(dist), dt)
+	return false
 end
 
 local function step(dt)
@@ -1791,18 +2089,18 @@ local function step(dt)
 
 	-- новый персонаж (смерть/респавн): сбрасываем зону и отход — в зону после смерти не идём
 	local char = player.Character
-	if char ~= lastChar then
-		lastChar = char
-		resetLatches()
-		glideVel = Vector3.zero
+	if char ~= M.lastChar then
+		M.lastChar = char
+		M.resetLatches()
+		M.glideVel = Vector3.zero
 	end
 
-	local hum, root = getMyHumanoid(), getMyRoot()
+	local hum, root = M.getMyHumanoid(), M.getMyRoot()
 	if not hum or not root or hum.Health <= 0 then
-		currentTarget = nil
-		resetLatches()
-		glideVel = Vector3.zero
-		setStatus("Ждём персонажа...", C.sub)
+		M.currentTarget = nil
+		M.resetLatches()
+		M.glideVel = Vector3.zero
+		M.setStatus("Ждём персонажа...", C.sub)
 		return
 	end
 
@@ -1817,62 +2115,80 @@ local function step(dt)
 
 	-- ближайший NPC (пересчёт несколько раз в секунду или сразу, если цель пропала)
 	local now = os.clock()
-	if not targetValid(currentTarget) or now - lastRetarget > 0.15 then
-		currentTarget = findNearest(root.Position)
-		lastRetarget = now
+	local bossLocked = M.bossSpec(M.currentTarget) ~= nil -- босс «залипает»: не переключаемся, пока он жив
+	if not M.targetValid(M.currentTarget) or (not bossLocked and now - M.lastRetarget > 0.15) then
+		M.currentTarget = M.findNearest(root.Position)
+		M.lastRetarget = now
 	end
-	local target = currentTarget
+	local target = M.currentTarget
+
+	-- слежение за целью: подписка на события смерти и проверки «призрака»
+	if target then
+		if target ~= M.watchTarget then
+			M.watchTarget = target
+			M.progBestGap, M.progSince, M.visFailCount, M.animFailCount = nil, now, 0, 0
+			M.ghostTarget = nil
+			if state.deathEvents then
+				M.hookInst(target.inst, target.hum)
+			end
+		end
+		local reason = M.guardTarget(target, now)
+		if reason then
+			M.banTarget(target, reason)
+			target = nil
+		end
+	end
 
 	-- безопасная зона: включаем при HP <= zoneHp, снимаем когда пропали все цели
 	-- или когда HP выше порога держится zoneRecover секунд ПОДРЯД, пока персонаж стоит в зоне
 	if state.zoneEnabled then
-		if zoneActive then
-			if not target and candidatesReady then
-				noTargetTime += dt
-				if noTargetTime >= ZONE_RELEASE_DELAY then
-					zoneActive = false
-					zoneArmed = false
-					noTargetTime = 0
+		if M.zoneActive then
+			if not target and M.candidatesReady then
+				M.noTargetTime += dt
+				if M.noTargetTime >= M.ZONE_RELEASE_DELAY then
+					M.zoneActive = false
+					M.zoneArmed = false
+					M.noTargetTime = 0
 				end
 			else
-				noTargetTime = 0
+				M.noTargetTime = 0
 			end
 
-			if zoneActive then
-				if hp > state.zoneHp and pointInZone(root.Position) then
-					zoneRecoverTime += dt
-					if zoneRecoverTime >= state.zoneRecover then
-						zoneActive = false
-						zoneArmed = true
-						zoneRecoverTime = 0
-						noTargetTime = 0
+			if M.zoneActive then
+				if hp > state.zoneHp and M.pointInZone(root.Position) then
+					M.zoneRecoverTime += dt
+					if M.zoneRecoverTime >= state.zoneRecover then
+						M.zoneActive = false
+						M.zoneArmed = true
+						M.zoneRecoverTime = 0
+						M.noTargetTime = 0
 					end
 				else
-					zoneRecoverTime = 0
+					M.zoneRecoverTime = 0
 				end
 			end
 		else
 			if hp > state.zoneHp then
-				zoneArmed = true
-			elseif zoneArmed and hp <= state.zoneHp then
-				zoneActive = true
-				noTargetTime = 0
-				zoneRecoverTime = 0
+				M.zoneArmed = true
+			elseif M.zoneArmed and hp <= state.zoneHp then
+				M.zoneActive = true
+				M.noTargetTime = 0
+				M.zoneRecoverTime = 0
 			end
 		end
 	else
-		zoneActive = false
+		M.zoneActive = false
 	end
 
 	-- отход: включаем при HP <= retreatHp, выключаем когда HP стало выше
 	if state.retreat then
-		if not retreating and hp <= state.retreatHp then
-			retreating = true
-		elseif retreating and hp > state.retreatHp then
-			retreating = false
+		if not M.retreating and hp <= state.retreatHp then
+			M.retreating = true
+		elseif M.retreating and hp > state.retreatHp then
+			M.retreating = false
 		end
 	else
-		retreating = false
+		M.retreating = false
 	end
 
 	-- направление на цель и поворот лицом к ней
@@ -1881,37 +2197,38 @@ local function step(dt)
 		local offset = target.root.Position - root.Position
 		flat = Vector3.new(offset.X, 0, offset.Z)
 		if state.face then
-			faceDirection(root, flat, dt)
+			M.faceDirection(root, flat, dt)
 		end
 	end
 
 	-- 1) Безопасная зона (высший приоритет)
-	if zoneActive then
+	if M.zoneActive then
+		M.progBestGap = nil
 		local p = root.Position
-		if pointInZone(p) then
+		if M.pointInZone(p) then
 			hum:Move(Vector3.zero, false)
-			applyGlide(root, Vector3.zero, dt)
-			stuckTime = 0
+			M.applyGlide(root, Vector3.zero, dt)
+			M.stuckTime = 0
 			local suffix = ""
 			if hp > state.zoneHp then
-				suffix = (" • выход через %d с"):format(math.ceil(state.zoneRecover - zoneRecoverTime))
+				suffix = (" • выход через %d с"):format(math.ceil(state.zoneRecover - M.zoneRecoverTime))
 			end
-			setStatus(("Зона: на месте (HP %d)%s"):format(math.floor(hp), suffix), C.yellow)
+			M.setStatus(("Зона: на месте (HP %d)%s"):format(math.floor(hp), suffix), C.yellow)
 		else
-			local goal = zoneGoalPoint(p)
+			local goal = M.zoneGoalPoint(p)
 			local to = Vector3.new(goal.X - p.X, 0, goal.Z - p.Z)
 			local dist = to.Magnitude
 			if dist > 0.05 then
 				local dir = to.Unit
-				local speed = approachSpeed(dist)
+				local speed = M.approachSpeed(dist)
 				hum:Move(dir, false)
-				applyGlide(root, dir * speed, dt)
+				M.applyGlide(root, dir * speed, dt)
 			else
 				hum:Move(Vector3.zero, false)
-				applyGlide(root, Vector3.zero, dt)
+				M.applyGlide(root, Vector3.zero, dt)
 			end
-			setStatus(("Зона: иду (HP %d)"):format(math.floor(hp)), C.yellow)
-			checkStuck(hum, root, dt, true)
+			M.setStatus(("Зона: иду (HP %d)"):format(math.floor(hp)), C.yellow)
+			M.checkStuck(hum, root, dt, true)
 		end
 		return
 	end
@@ -1919,14 +2236,15 @@ local function step(dt)
 	-- нет целей
 	if not target then
 		hum:Move(Vector3.zero, false)
-		applyGlide(root, Vector3.zero, dt)
-		stuckTime = 0
-		setStatus(searchNote or "Целей нет", C.text)
+		M.applyGlide(root, Vector3.zero, dt)
+		M.stuckTime = 0
+		M.setStatus(M.searchNote or "Целей нет", C.text)
 		return
 	end
 
 	-- 2) Отход от цели при низком HP (смотрим на цель, пятимся)
-	if retreating then
+	if M.retreating then
+		M.progBestGap = nil
 		local away = -flat
 		if away.Magnitude < 0.1 then
 			local look = root.CFrame.LookVector
@@ -1934,131 +2252,233 @@ local function step(dt)
 		end
 		local dir = away.Unit
 		hum:Move(dir, false)
-		applyGlide(root, dir * state.glideSpeed, dt)
-		setStatus(("Отход (HP %d)"):format(math.floor(hp)), C.yellow)
-		checkStuck(hum, root, dt, true)
+		M.applyGlide(root, dir * state.glideSpeed, dt)
+		M.setStatus(("Отход (HP %d)"):format(math.floor(hp)), C.yellow)
+		M.checkStuck(hum, root, dt, true)
 		return
 	end
 
-	-- 3) Обычное движение к цели
-	local gap = edgeGap(target, root)
+	-- 3) Особый маршрут боссов (The Undying Guardian / The Spooky Knight)
+	local spec = M.bossSpec(target)
+	if spec then
+		if M.bossTarget ~= target then
+			M.bossTarget = target
+			M.bossEngaged = false
+			M.bossCorner = nil
+			M.bossPhaseSince = now
+			if state.bossApproachFirst then
+				M.bossPhase = "approach"
+				local d = (target.root.Position - root.Position).Magnitude
+				M.bossLimit = M.BOSS_APPROACH_BASE + (d / math.max(state.glideSpeed, 1)) * 1.5
+			else
+				M.bossPhase = "hold"
+			end
+		end
+		if M.bossPhase == "approach" and now - M.bossPhaseSince > M.bossLimit then
+			M.bossPhase = "hold" -- не дошли за отведённое время — всё равно уходим в зону
+		end
+
+		if M.bossPhase == "hold" then
+			M.progBestGap = nil
+			M.ghostTarget = nil
+			local p = root.Position
+			local tpos = target.root.Position
+
+			-- всегда остаёмся в зоне; если вышли — возвращаемся
+			if not M.pointInZone(p) then
+				M.glideToPoint(hum, root, M.zoneGoalPoint(p), dt)
+				M.setStatus("Босс: иду в зону", C.yellow)
+				M.checkStuck(hum, root, dt, true)
+				return
+			end
+
+			-- босс в зоне или рядом с ней? (с гистерезисом, чтобы не дёргаться на границе)
+			local zd = M.zoneDistance(tpos)
+			local near
+			if M.bossEngaged then
+				near = zd <= state.bossMargin + M.BOSS_HYST
+			else
+				near = zd <= state.bossMargin
+			end
+			M.bossEngaged = near
+
+			if near then
+				-- подходим к боссу, не выходя из зоны
+				if M.edgeGap(target, root) <= state.stopDist then
+					hum:Move(Vector3.zero, false)
+					M.applyGlide(root, Vector3.zero, dt)
+					M.stuckTime = 0
+					M.setStatus("Босс: бью из зоны", C.yellow)
+				else
+					M.glideToPoint(hum, root, M.clampToZone(tpos), dt)
+					M.setStatus("Босс: подхожу из зоны", C.yellow)
+					M.checkStuck(hum, root, dt, true)
+				end
+				return
+			end
+
+			-- босс далеко от зоны
+			if spec.corner then
+				-- Undying Guardian: ждём в самом дальнем от него углу
+				if not M.bossCorner or now - M.bossCornerAt > 1.5 then
+					local idx, d = M.farCornerIndex(tpos)
+					if not M.bossCorner then
+						M.bossCorner = idx
+					elseif idx ~= M.bossCorner and d > M.flatDist(M.ZONE_POINTS[M.bossCorner], tpos) + 6 then
+						M.bossCorner = idx -- меняем угол только если новый заметно дальше
+					end
+					M.bossCornerAt = now
+				end
+				M.glideToPoint(hum, root, M.cornerPoint(M.bossCorner), dt)
+				M.setStatus("Босс: жду в дальнем углу", C.yellow)
+			else
+				-- Spooky Knight: просто стоим в зоне
+				hum:Move(Vector3.zero, false)
+				M.applyGlide(root, Vector3.zero, dt)
+				M.stuckTime = 0
+				M.setStatus("Босс: жду в зоне", C.yellow)
+			end
+			return
+		end
+		-- фаза "approach": обычное движение к боссу ниже
+	else
+		M.bossTarget, M.bossPhase = nil, nil
+	end
+
+	-- 4) Обычное движение к цели
+	local gap = M.edgeGap(target, root)
 	local remaining = gap - state.stopDist
 
 	if remaining <= 0.05 or flat.Magnitude < 0.1 then
 		hum:Move(Vector3.zero, false)
-		applyGlide(root, Vector3.zero, dt)
-		stuckTime = 0
-		setStatus("У цели: " .. target.name, C.text)
+		M.applyGlide(root, Vector3.zero, dt)
+		M.stuckTime = 0
+		M.progBestGap = nil
+		if M.bossPhase == "approach" then
+			M.bossPhase = "hold" -- дошли до босса — сразу уходим в зону
+		end
+		M.setStatus("У цели: " .. target.name, C.text)
 
-		-- страж: мы стоим у цели, а её HP не меняется и она не двигается -> цель «зависла»
+		-- страж «у цели»: HP не меняется и цель не двигается -> «призрак»
 		if state.ghostFilter then
-			local sig = hpSignature(target.inst)
+			local sig = M.hpSignature(target.inst)
 			local tpos = target.root.Position
-			if ghostTarget ~= target then
-				ghostTarget, ghostSince, ghostSig, ghostPos = target, now, sig, tpos
+			if M.ghostTarget ~= target then
+				M.ghostTarget, M.ghostSince, M.ghostSig, M.ghostPos = target, now, sig, tpos
 			else
-				if sig ~= ghostSig or (tpos - ghostPos).Magnitude > 0.5 then
-					ghostSince, ghostSig, ghostPos = now, sig, tpos
+				if sig ~= M.ghostSig or (tpos - M.ghostPos).Magnitude > 0.5 then
+					M.ghostSince, M.ghostSig, M.ghostPos = now, sig, tpos
 				end
-				if sig ~= nil and now - ghostSince >= state.ghostSeconds then
-					blacklist[target.inst] = now + GHOST_BAN_SECONDS
-					ghostTarget = nil
-					currentTarget = nil
-					setStatus("Пропущена зависшая цель: " .. target.name, C.yellow)
+				-- если у цели нет данных о HP — ждём вдвое дольше
+				local limit = (sig ~= nil) and state.ghostSeconds or state.ghostSeconds * 2
+				if now - M.ghostSince >= limit then
+					M.banTarget(target, ("стоим у цели %d с, она не меняется"):format(limit))
+					return
 				end
 			end
 		end
 		return
 	end
 
-	ghostTarget = nil
-	local dir = flat.Unit
-	local speed = approachSpeed(remaining)
-	hum:Move(dir, false)
-	applyGlide(root, dir * speed, dt)
-	setStatus("К цели: " .. target.name, C.yellow)
+	M.ghostTarget = nil
 
-	checkStuck(hum, root, dt, gap > 3.5)
+	-- страж прогресса: зазор должен уменьшаться, иначе цель недоступна / «призрак»
+	if state.progressCheck then
+		if M.progBestGap == nil or gap < M.progBestGap - 1.0 then
+			M.progBestGap, M.progSince = gap, now
+		elseif now - M.progSince >= state.ghostSeconds then
+			M.banTarget(target, ("нет прогресса в приближении %d с (зазор %.1f)"):format(state.ghostSeconds, gap))
+			return
+		end
+	end
+
+	local dir = flat.Unit
+	local speed = M.approachSpeed(remaining)
+	hum:Move(dir, false)
+	M.applyGlide(root, dir * speed, dt)
+	M.setStatus("К цели: " .. target.name, C.yellow)
+
+	M.checkStuck(hum, root, dt, gap > 3.5)
 end
 
-local function start()
+function M.start()
 	if not state.alive or state.running then return end
-	if MODES_BY_ID[state.mode].needsQuery then
-		local newText = queryBox.Text
+	if M.MODES_BY_ID[state.mode].needsQuery then
+		local newText = M.queryBox.Text
 		if newText ~= (state.queries[state.mode] or "") then
 			state.queries[state.mode] = newText
-			requestRefresh()
+			M.requestRefresh()
 		end
 	end
 	state.running = true
-	currentTarget = nil
-	stuckTime = 0
-	resetLatches()
-	glideVel = Vector3.zero
-	lastStatus = nil
-	setStatus("Запуск...", C.yellow)
-	unbindMove()
-	isBound = true
-	RunService:BindToRenderStep(BIND_NAME, Enum.RenderPriority.Last.Value, step)
+	M.currentTarget = nil
+	M.stuckTime = 0
+	M.resetLatches()
+	M.glideVel = Vector3.zero
+	M.lastStatus = nil
+	M.setStatus("Запуск...", C.yellow)
+	M.unbindMove()
+	M.isBound = true
+	RunService:BindToRenderStep(M.BIND_NAME, Enum.RenderPriority.Last.Value, step)
 end
 
-local function stop()
+function M.stop()
 	if not state.running then return end
 	state.running = false
-	unbindMove()
-	stopMoving()
-	stopGlide()
-	setAutoRotate(true)
-	currentTarget = nil
-	resetLatches()
-	setStatus("Остановлено", C.sub)
+	M.unbindMove()
+	M.stopMoving()
+	M.stopGlide()
+	M.setAutoRotate(true)
+	M.currentTarget = nil
+	M.resetLatches()
+	M.setStatus("Остановлено", C.sub)
 end
 
 ------------------------------------------------------------
 -- Вид сверху: камера над игроком, направлена вниз на него и едет вместе с ним
 ------------------------------------------------------------
-local TOPVIEW_BIND = "NPCWalkerTopView"
-local topViewBound = false
-local topViewForward = Vector3.new(0, 0, -1)
-local savedCameraType = nil
+M.TOPVIEW_BIND = "NPCWalkerTopView"
+M.topViewBound = false
+M.topViewForward = Vector3.new(0, 0, -1)
+M.savedCameraType = nil
 
-local function topViewStep()
+function M.topViewStep()
 	local camera = workspace.CurrentCamera
-	local root = getMyRoot()
+	local root = M.getMyRoot()
 	if not camera or not root then return end
 	if camera.CameraType ~= Enum.CameraType.Scriptable then
 		camera.CameraType = Enum.CameraType.Scriptable
 	end
 	local pos = root.Position
-	camera.CFrame = CFrame.lookAt(pos + Vector3.new(0, state.topViewHeight, 0), pos, topViewForward)
+	camera.CFrame = CFrame.lookAt(pos + Vector3.new(0, state.topViewHeight, 0), pos, M.topViewForward)
 end
 
-local function setTopView(on)
+function M.setTopView(on)
 	state.topView = on
 	local camera = workspace.CurrentCamera
 	if on then
-		if topViewBound then return end
+		if M.topViewBound then return end
 		if camera then
-			savedCameraType = camera.CameraType
+			M.savedCameraType = camera.CameraType
 			-- направление «вверх экрана» берём из текущего взгляда камеры
 			local look = camera.CFrame.LookVector
 			local flat = Vector3.new(look.X, 0, look.Z)
-			topViewForward = flat.Magnitude > 0.05 and flat.Unit or Vector3.new(0, 0, -1)
+			M.topViewForward = flat.Magnitude > 0.05 and flat.Unit or Vector3.new(0, 0, -1)
 		end
-		topViewBound = true
-		RunService:BindToRenderStep(TOPVIEW_BIND, Enum.RenderPriority.Camera.Value + 1, topViewStep)
+		M.topViewBound = true
+		RunService:BindToRenderStep(M.TOPVIEW_BIND, Enum.RenderPriority.Camera.Value + 1, M.topViewStep)
 	else
-		if topViewBound then
-			topViewBound = false
-			pcall(function() RunService:UnbindFromRenderStep(TOPVIEW_BIND) end)
+		if M.topViewBound then
+			M.topViewBound = false
+			pcall(function() RunService:UnbindFromRenderStep(M.TOPVIEW_BIND) end)
 		end
 		if camera then
-			if savedCameraType and savedCameraType ~= Enum.CameraType.Scriptable then
-				camera.CameraType = savedCameraType
+			if M.savedCameraType and M.savedCameraType ~= Enum.CameraType.Scriptable then
+				camera.CameraType = M.savedCameraType
 			else
 				camera.CameraType = Enum.CameraType.Custom
 			end
-			local hum = getMyHumanoid()
+			local hum = M.getMyHumanoid()
 			if hum then
 				camera.CameraSubject = hum
 			end
@@ -2069,24 +2489,24 @@ end
 ------------------------------------------------------------
 -- Точка клика после смерти (маркер + стрелки) — объекты
 ------------------------------------------------------------
-local markerGui = Instance.new("ScreenGui")
-markerGui.Name = "NPCWalkerMarker"
-markerGui.ResetOnSpawn = false
-markerGui.IgnoreGuiInset = true -- чтобы координаты маркера совпадали с координатами клика
-markerGui.DisplayOrder = 1000
-markerGui.Parent = guiParent
+M.markerGui = Instance.new("ScreenGui")
+M.markerGui.Name = "NPCWalkerMarker"
+M.markerGui.ResetOnSpawn = false
+M.markerGui.IgnoreGuiInset = true -- чтобы координаты маркера совпадали с координатами клика
+M.markerGui.DisplayOrder = 1000
+M.markerGui.Parent = M.guiParent
 
-local marker = Instance.new("Frame")
-marker.AnchorPoint = Vector2.new(0.5, 0.5)
-marker.Size = UDim2.fromOffset(22, 22)
-marker.BackgroundColor3 = C.yellow
-marker.BackgroundTransparency = 0.2
-marker.BorderSizePixel = 0
-marker.Visible = false
-marker.Parent = markerGui
-Instance.new("UICorner", marker).CornerRadius = UDim.new(1, 0)
+M.marker = Instance.new("Frame")
+M.marker.AnchorPoint = Vector2.new(0.5, 0.5)
+M.marker.Size = UDim2.fromOffset(22, 22)
+M.marker.BackgroundColor3 = C.yellow
+M.marker.BackgroundTransparency = 0.2
+M.marker.BorderSizePixel = 0
+M.marker.Visible = false
+M.marker.Parent = M.markerGui
+Instance.new("UICorner", M.marker).CornerRadius = UDim.new(1, 0)
 do
-	local ms = Instance.new("UIStroke", marker)
+	local ms = Instance.new("UIStroke", M.marker)
 	ms.Color = C.black
 	ms.Thickness = 2
 end
@@ -2094,43 +2514,47 @@ end
 ------------------------------------------------------------
 -- Полное выключение
 ------------------------------------------------------------
-local function shutdown()
+function M.shutdown()
 	if not state.alive then return end
 	state.running = false
 	state.farm = false
-	unbindMove()
-	stopMoving()
-	stopGlide()
-	setAutoRotate(true)
-	setTopView(false)
-	stopFarmLoops()
-	refreshId += 1
-	deathToken += 1
+	M.unbindMove()
+	M.stopMoving()
+	M.stopGlide()
+	M.setAutoRotate(true)
+	M.setTopView(false)
+	M.stopFarmLoops()
+	M.refreshId += 1
+	M.deathToken += 1
 	state.alive = false
-	if diedConn then
-		diedConn:Disconnect()
-		diedConn = nil
+	if M.diedConn then
+		M.diedConn:Disconnect()
+		M.diedConn = nil
 	end
-	for _, c in ipairs(farmConns) do
+	for _, c in ipairs(M.farmConns) do
 		pcall(function() c:Disconnect() end)
 	end
-	table.clear(farmConns)
+	table.clear(M.farmConns)
 	for _, c in ipairs(connections) do
 		pcall(function() c:Disconnect() end)
 	end
 	table.clear(connections)
-	table.clear(npcHumanoids)
-	candidates = {}
-	currentTarget = nil
-	markerGui:Destroy()
-	gui:Destroy()
+	table.clear(M.npcHumanoids)
+	M.candidates = {}
+	M.currentTarget = nil
+	for _, c in ipairs(M.hookConns) do
+		pcall(function() c:Disconnect() end)
+	end
+	table.clear(M.hookConns)
+	M.markerGui:Destroy()
+	M.gui:Destroy()
 end
 
 ------------------------------------------------------------
 -- Содержимое вкладок
 ------------------------------------------------------------
 -- шаг зазора: 0.1 до 2 студов, дальше 0.5
-local function distStep(dir, cur)
+function M.distStep(dir, cur)
 	if (dir > 0 and cur >= 2) or (dir < 0 and cur > 2) then
 		return 0.5
 	end
@@ -2139,55 +2563,55 @@ end
 
 -- ===== ГЛАВНАЯ =====
 do
-	local pf = pageMain.frame
+	local pf = M.pageMain.frame
 
 	local card = Instance.new("Frame")
 	card.Size = UDim2.new(1, 0, 0, 48)
 	card.BackgroundColor3 = C.card
 	card.BorderSizePixel = 0
-	card.LayoutOrder = nextOrder(pageMain)
+	card.LayoutOrder = M.nextOrder(M.pageMain)
 	card.Parent = pf
 	Instance.new("UICorner", card).CornerRadius = UDim.new(0, 8)
 
-	statusLabel = Instance.new("TextLabel")
-	statusLabel.BackgroundTransparency = 1
-	statusLabel.Position = UDim2.fromOffset(10, 5)
-	statusLabel.Size = UDim2.new(1, -20, 0, 20)
-	statusLabel.Font = Enum.Font.GothamBold
-	statusLabel.TextSize = 13
-	statusLabel.TextColor3 = C.sub
-	statusLabel.TextXAlignment = Enum.TextXAlignment.Left
-	statusLabel.TextTruncate = Enum.TextTruncate.AtEnd
-	statusLabel.Text = "Остановлено"
-	statusLabel.Parent = card
+	M.statusLabel = Instance.new("TextLabel")
+	M.statusLabel.BackgroundTransparency = 1
+	M.statusLabel.Position = UDim2.fromOffset(10, 5)
+	M.statusLabel.Size = UDim2.new(1, -20, 0, 20)
+	M.statusLabel.Font = Enum.Font.GothamBold
+	M.statusLabel.TextSize = 13
+	M.statusLabel.TextColor3 = C.sub
+	M.statusLabel.TextXAlignment = Enum.TextXAlignment.Left
+	M.statusLabel.TextTruncate = Enum.TextTruncate.AtEnd
+	M.statusLabel.Text = "Остановлено"
+	M.statusLabel.Parent = card
 
-	infoLabel = Instance.new("TextLabel")
-	infoLabel.BackgroundTransparency = 1
-	infoLabel.Position = UDim2.fromOffset(10, 26)
-	infoLabel.Size = UDim2.new(1, -20, 0, 16)
-	infoLabel.Font = Enum.Font.Gotham
-	infoLabel.TextSize = 11
-	infoLabel.TextColor3 = C.sub
-	infoLabel.TextXAlignment = Enum.TextXAlignment.Left
-	infoLabel.TextTruncate = Enum.TextTruncate.AtEnd
-	infoLabel.Text = "Поиск целей..."
-	infoLabel.Parent = card
+	M.infoLabel = Instance.new("TextLabel")
+	M.infoLabel.BackgroundTransparency = 1
+	M.infoLabel.Position = UDim2.fromOffset(10, 26)
+	M.infoLabel.Size = UDim2.new(1, -20, 0, 16)
+	M.infoLabel.Font = Enum.Font.Gotham
+	M.infoLabel.TextSize = 11
+	M.infoLabel.TextColor3 = C.sub
+	M.infoLabel.TextXAlignment = Enum.TextXAlignment.Left
+	M.infoLabel.TextTruncate = Enum.TextTruncate.AtEnd
+	M.infoLabel.Text = "Поиск целей..."
+	M.infoLabel.Parent = card
 
 	local row = Instance.new("Frame")
 	row.Size = UDim2.new(1, 0, 0, 38)
 	row.BackgroundTransparency = 1
-	row.LayoutOrder = nextOrder(pageMain)
+	row.LayoutOrder = M.nextOrder(M.pageMain)
 	row.Parent = pf
-	startBtn = makeButton(row, "▶  СТАРТ", C.yellow, C.black, UDim2.new(0.5, -3, 1, 0))
-	stopBtn = makeButton(row, "■  СТОП", C.btn, C.text, UDim2.new(0.5, -3, 1, 0))
-	stopBtn.AnchorPoint = Vector2.new(1, 0)
-	stopBtn.Position = UDim2.new(1, 0, 0, 0)
+	M.startBtn = makeButton(row, "▶  СТАРТ", C.yellow, C.black, UDim2.new(0.5, -3, 1, 0))
+	M.stopBtn = makeButton(row, "■  СТОП", C.btn, C.text, UDim2.new(0.5, -3, 1, 0))
+	M.stopBtn.AnchorPoint = Vector2.new(1, 0)
+	M.stopBtn.Position = UDim2.new(1, 0, 0, 0)
 
-	farmOrder = nextOrder(pageMain)
-	buildFarmButton()
+	M.farmOrder = M.nextOrder(M.pageMain)
+	M.buildFarmButton()
 
 	local topViewBtn = makeButton(pf, "", C.btn, C.text, UDim2.new(1, 0, 0, 32))
-	topViewBtn.LayoutOrder = nextOrder(pageMain)
+	topViewBtn.LayoutOrder = M.nextOrder(M.pageMain)
 	topViewBtn.Font = Enum.Font.GothamMedium
 	topViewBtn.TextSize = 12
 	local function refreshTopViewBtn()
@@ -2197,151 +2621,259 @@ do
 	end
 	refreshTopViewBtn()
 	track(topViewBtn.Activated:Connect(function()
-		setTopView(not state.topView)
+		M.setTopView(not state.topView)
 		refreshTopViewBtn()
 	end))
 
-	modeBtn = makeButton(pf, "", C.card, C.text, UDim2.new(1, 0, 0, 32))
-	modeBtn.LayoutOrder = nextOrder(pageMain)
-	modeBtn.Font = Enum.Font.GothamMedium
-	modeBtn.TextSize = 12
+	M.modeBtn = makeButton(pf, "", C.card, C.text, UDim2.new(1, 0, 0, 32))
+	M.modeBtn.LayoutOrder = M.nextOrder(M.pageMain)
+	M.modeBtn.Font = Enum.Font.GothamMedium
+	M.modeBtn.TextSize = 12
 
-	queryBox = Instance.new("TextBox")
-	queryBox.LayoutOrder = nextOrder(pageMain)
-	queryBox.Size = UDim2.new(1, 0, 0, 32)
-	queryBox.BackgroundColor3 = C.card
-	queryBox.BorderSizePixel = 0
-	queryBox.Font = Enum.Font.Gotham
-	queryBox.TextSize = 12
-	queryBox.TextColor3 = C.text
-	queryBox.PlaceholderColor3 = C.sub
-	queryBox.TextXAlignment = Enum.TextXAlignment.Left
-	queryBox.ClearTextOnFocus = false
-	queryBox.ClipsDescendants = true
-	queryBox.Text = ""
-	queryBox.Visible = false
-	queryBox.Parent = pf
-	Instance.new("UICorner", queryBox).CornerRadius = UDim.new(0, 8)
+	M.queryBox = Instance.new("TextBox")
+	M.queryBox.LayoutOrder = M.nextOrder(M.pageMain)
+	M.queryBox.Size = UDim2.new(1, 0, 0, 32)
+	M.queryBox.BackgroundColor3 = C.card
+	M.queryBox.BorderSizePixel = 0
+	M.queryBox.Font = Enum.Font.Gotham
+	M.queryBox.TextSize = 12
+	M.queryBox.TextColor3 = C.text
+	M.queryBox.PlaceholderColor3 = C.sub
+	M.queryBox.TextXAlignment = Enum.TextXAlignment.Left
+	M.queryBox.ClearTextOnFocus = false
+	M.queryBox.ClipsDescendants = true
+	M.queryBox.Text = ""
+	M.queryBox.Visible = false
+	M.queryBox.Parent = pf
+	Instance.new("UICorner", M.queryBox).CornerRadius = UDim.new(0, 8)
 	do
-		local qpad = Instance.new("UIPadding", queryBox)
+		local qpad = Instance.new("UIPadding", M.queryBox)
 		qpad.PaddingLeft = UDim.new(0, 10)
 		qpad.PaddingRight = UDim.new(0, 10)
-		local qstroke = Instance.new("UIStroke", queryBox)
+		local qstroke = Instance.new("UIStroke", M.queryBox)
 		qstroke.Color = C.yellow
 		qstroke.Transparency = 0.6
 	end
 
-	offBtn = makeButton(pf, "⏻  ВЫКЛЮЧИТЬ СКРИПТ", C.white, C.black, UDim2.new(1, 0, 0, 34))
-	offBtn.LayoutOrder = nextOrder(pageMain)
-	offBtn.TextSize = 12
+	M.offBtn = makeButton(pf, "⏻  ВЫКЛЮЧИТЬ СКРИПТ", C.white, C.black, UDim2.new(1, 0, 0, 34))
+	M.offBtn.LayoutOrder = M.nextOrder(M.pageMain)
+	M.offBtn.TextSize = 12
 end
 
 -- ===== ДВИЖЕНИЕ =====
 do
-	local p = pageMove
-	addSection(p, "ЦЕЛЬ")
-	addNumber(p, "Зазор до цели, м", {
+	local p = M.pageMove
+	M.addSection(p, "ЦЕЛЬ")
+	M.addNumber(p, "Зазор до цели, м", {
 		get = function() return state.stopDist end,
 		set = function(v) state.stopDist = v end,
-		step = distStep, min = 0, max = 30, dec = 1,
+		step = M.distStep, min = 0, max = 30, dec = 1,
 	})
-	addNumber(p, "Скорость, ст/с", {
+	M.addNumber(p, "Скорость, ст/с", {
 		get = function() return state.glideSpeed end,
 		set = function(v) state.glideSpeed = v end,
 		step = 1, min = 1, max = 300, dec = 0,
 	})
-	addToggle(p, "Смотреть на цель", function() return state.face end, function(v)
+	M.addToggle(p, "Смотреть на цель", function() return state.face end, function(v)
 		state.face = v
 	end)
-	addToggle(p, "Прыжок при застревании", function() return state.autoJump end, function(v)
+	M.addToggle(p, "Прыжок при застревании", function() return state.autoJump end, function(v)
 		state.autoJump = v
 	end)
-	addToggle(p, "Пропуск зависших целей", function() return state.ghostFilter end, function(v)
+
+	M.addSection(p, "КАМЕРА")
+	M.addNumber(p, "Высота камеры", {
+		get = function() return state.topViewHeight end,
+		set = function(v) state.topViewHeight = v end,
+		step = 1, min = 5, max = 300, dec = 0,
+	})
+	M.addNote(p, "Кнопка «ВИД СВЕРХУ» находится на вкладке ГЛАВНАЯ.", 28)
+
+	M.addSection(p, "ЗАЩИТА ОТ «ПРИЗРАКОВ»")
+	M.addToggle(p, "События смерти цели", function() return state.deathEvents end, function(v)
+		state.deathEvents = v
+	end)
+	M.addToggle(p, "Цель вне карты", function() return state.posCheck end, function(v)
+		state.posCheck = v
+	end)
+	M.addToggle(p, "Цель невидима", function() return state.visCheck end, function(v)
+		state.visCheck = v
+	end)
+	M.addToggle(p, "Нет прогресса к цели", function() return state.progressCheck end, function(v)
+		state.progressCheck = v
+	end)
+	M.addToggle(p, "Цель не меняется рядом", function() return state.ghostFilter end, function(v)
 		state.ghostFilter = v
 	end)
-	addNumber(p, "Зависание цели, с", {
+	M.addToggle(p, "Нет анимаций (эксперимент)", function() return state.animCheck end, function(v)
+		state.animCheck = v
+	end)
+	M.addNumber(p, "Ожидание стража, с", {
 		get = function() return state.ghostSeconds end,
 		set = function(v) state.ghostSeconds = v end,
 		step = 1, min = 3, max = 120, dec = 0,
 	})
 
-	addSection(p, "КАМЕРА")
-	addNumber(p, "Высота камеры", {
-		get = function() return state.topViewHeight end,
-		set = function(v) state.topViewHeight = v end,
-		step = 1, min = 5, max = 300, dec = 0,
-	})
-	addNote(p, "Кнопка «ВИД СВЕРХУ» находится на вкладке ГЛАВНАЯ.", 28)
+	M.addSection(p, "ДИАГНОСТИКА ЦЕЛИ")
+	local diagLabel = Instance.new("TextLabel")
+	diagLabel.BackgroundColor3 = C.card
+	diagLabel.BorderSizePixel = 0
+	diagLabel.Size = UDim2.new(1, 0, 0, 0)
+	diagLabel.AutomaticSize = Enum.AutomaticSize.Y
+	diagLabel.Font = Enum.Font.Code
+	diagLabel.TextSize = 10
+	diagLabel.TextColor3 = C.text
+	diagLabel.TextXAlignment = Enum.TextXAlignment.Left
+	diagLabel.TextYAlignment = Enum.TextYAlignment.Top
+	diagLabel.TextWrapped = true
+	diagLabel.Text = "Когда скрипт идёт к «призраку», нажми «Снимок цели», затем «Копировать» и пришли текст. «Последний бан» показывает причину последнего автопропуска."
+	diagLabel.LayoutOrder = M.nextOrder(p)
+	diagLabel.Parent = p.frame
+	Instance.new("UICorner", diagLabel).CornerRadius = UDim.new(0, 8)
+	do
+		local dpad = Instance.new("UIPadding", diagLabel)
+		dpad.PaddingTop = UDim.new(0, 6)
+		dpad.PaddingBottom = UDim.new(0, 6)
+		dpad.PaddingLeft = UDim.new(0, 8)
+		dpad.PaddingRight = UDim.new(0, 8)
+	end
+	local diagText = diagLabel.Text
 
-	addSection(p, "ЗДОРОВЬЕ")
-	addToggle(p, "Отход при низком HP", function() return state.retreat end, function(v)
+	local function showDiag(text)
+		diagText = text
+		diagLabel.Text = text
+	end
+
+	local function copyText(text)
+		if setclipboard then
+			pcall(setclipboard, text)
+			return true
+		end
+		if toclipboard then
+			pcall(toclipboard, text)
+			return true
+		end
+		if writefile then
+			pcall(writefile, "WebValley_diag.txt", text)
+			return true
+		end
+		return false
+	end
+
+	local drow = Instance.new("Frame")
+	drow.Size = UDim2.new(1, 0, 0, 30)
+	drow.BackgroundTransparency = 1
+	drow.LayoutOrder = M.nextOrder(p)
+	drow.Parent = p.frame
+
+	local snapBtn = makeButton(drow, "Снимок цели", C.btn, C.text, UDim2.new(1 / 3, -4, 1, 0))
+	snapBtn.TextSize = 11
+	local banBtn = makeButton(drow, "Последний бан", C.btn, C.text, UDim2.new(1 / 3, -4, 1, 0))
+	banBtn.Position = UDim2.new(1 / 3, 2, 0, 0)
+	banBtn.TextSize = 11
+	local copyBtn = makeButton(drow, "Копировать", C.yellow, C.black, UDim2.new(1 / 3, -4, 1, 0))
+	copyBtn.Position = UDim2.new(2 / 3, 4, 0, 0)
+	copyBtn.TextSize = 11
+
+	track(snapBtn.Activated:Connect(function()
+		local target = M.currentTarget
+		if not target then
+			local root = M.getMyRoot()
+			if root then
+				target = M.findNearest(root.Position)
+			end
+		end
+		if target then
+			showDiag("СНИМОК ЦЕЛИ\n" .. M.describeTarget(target))
+		else
+			showDiag("Цели сейчас нет.")
+		end
+	end))
+	track(banBtn.Activated:Connect(function()
+		local entry = M.banLog[1]
+		if entry then
+			showDiag(("ПОСЛЕДНИЙ БАН: %s\nПричина: %s\n%s"):format(entry.name, entry.reason, entry.dump))
+		else
+			showDiag("Автопропусков пока не было.")
+		end
+	end))
+	track(copyBtn.Activated:Connect(function()
+		local ok = copyText(diagText)
+		copyBtn.Text = ok and "Скопировано" or "Недоступно"
+		task.delay(1.2, function()
+			copyBtn.Text = "Копировать"
+		end)
+	end))
+
+	M.addSection(p, "ЗДОРОВЬЕ")
+	M.addToggle(p, "Отход при низком HP", function() return state.retreat end, function(v)
 		state.retreat = v
 	end)
-	addNumber(p, "Порог отхода, HP", {
+	M.addNumber(p, "Порог отхода, HP", {
 		get = function() return state.retreatHp end,
 		set = function(v) state.retreatHp = v end,
 		step = 1, min = 1, max = 100, dec = 0,
 	})
-	addToggle(p, "Безопасная зона (по HP)", function() return state.zoneEnabled end, function(v)
+	M.addToggle(p, "Безопасная зона (по HP)", function() return state.zoneEnabled end, function(v)
 		state.zoneEnabled = v
-		if not v then zoneActive = false end
+		if not v then M.zoneActive = false end
 	end)
-	addNumber(p, "Порог зоны, HP", {
+	M.addNumber(p, "Порог зоны, HP", {
 		get = function() return state.zoneHp end,
 		set = function(v) state.zoneHp = v end,
 		step = 1, min = 1, max = 100, dec = 0,
 	})
-	addNumber(p, "Выход из зоны, с", {
+	M.addNumber(p, "Выход из зоны, с", {
 		get = function() return state.zoneRecover end,
 		set = function(v) state.zoneRecover = v end,
 		step = 1, min = 1, max = 120, dec = 0,
 	})
-	addNote(p, "Зона: после смерти не включается. Отсчёт выхода идёт, только когда персонаж уже в зоне.", 40)
+	M.addNote(p, "Зона: после смерти не включается. Отсчёт выхода идёт, только когда персонаж уже в зоне.", 40)
 end
 
 -- ===== ФАРМ =====
-local setPointPanel = nil
+M.setPointPanel = nil
 do
-	local p = pageFarm
-	addSection(p, "КЛИКЕР")
-	addToggle(p, "Постоянные клики", function() return state.autoClick end, function(v)
+	local p = M.pageFarm
+	M.addSection(p, "КЛИКЕР")
+	M.addToggle(p, "Постоянные клики", function() return state.autoClick end, function(v)
 		state.autoClick = v
 	end)
-	addNumber(p, "Кликов в секунду", {
+	M.addNumber(p, "Кликов в секунду", {
 		get = function() return state.clicksPerSec end,
 		set = function(v) state.clicksPerSec = v end,
 		step = 1, min = 1, max = 30, dec = 0,
 	})
 
-	addSection(p, "СКИП BOSSBAR")
-	addToggle(p, "Авто-скип Bossbar", function() return state.autoSkip end, function(v)
+	M.addSection(p, "СКИП BOSSBAR")
+	M.addToggle(p, "Авто-скип Bossbar", function() return state.autoSkip end, function(v)
 		state.autoSkip = v
 	end)
-	addToggle(p, "Повтор скипа (2 с)", function() return state.skipRepeat end, function(v)
+	M.addToggle(p, "Повтор скипа (2 с)", function() return state.skipRepeat end, function(v)
 		state.skipRepeat = v
 	end)
-	addNumber(p, "Радиус целей, м", {
+	M.addNumber(p, "Радиус целей, м", {
 		get = function() return state.farmRadius end,
 		set = function(v) state.farmRadius = v end,
 		step = 10, min = 10, max = 3000, dec = 0,
 	})
 
-	addSection(p, "ПОСЛЕ СМЕРТИ")
-	addToggle(p, "Клавиши 2 → 1 (30 с)", function() return state.deathKeys end, function(v)
+	M.addSection(p, "ПОСЛЕ СМЕРТИ")
+	M.addToggle(p, "Клавиши 2 → 1 (30 с)", function() return state.deathKeys end, function(v)
 		state.deathKeys = v
 	end)
-	addToggle(p, "Кнопка Ready (10 с)", function() return state.deathReady end, function(v)
+	M.addToggle(p, "Кнопка Ready (10 с)", function() return state.deathReady end, function(v)
 		state.deathReady = v
 	end)
-	addToggle(p, ("Клик в точку (+%d с, ×%d)"):format(DEATH_CLICK_DELAY, DEATH_CLICK_COUNT),
+	M.addToggle(p, ("Клик в точку (+%d с, ×%d)"):format(M.DEATH_CLICK_DELAY, M.DEATH_CLICK_COUNT),
 		function() return state.deathClick end, function(v)
 			state.deathClick = v
 		end)
 
 	-- выбор точки клика стрелками
 	local panel = nil
-	local pointBtn = addButton(p, "", C.card, C.text, 32, function()
-		setPointPanel(not (panel and panel.Visible))
+	local pointBtn = M.addButton(p, "", C.card, C.text, 32, function()
+		M.setPointPanel(not (panel and panel.Visible))
 	end)
 	pointBtn.Font = Enum.Font.GothamMedium
 	pointBtn.TextSize = 12
@@ -2351,7 +2883,7 @@ do
 	panel.BackgroundColor3 = C.card
 	panel.BorderSizePixel = 0
 	panel.Visible = false
-	panel.LayoutOrder = nextOrder(p)
+	panel.LayoutOrder = M.nextOrder(p)
 	panel.Parent = p.frame
 	Instance.new("UICorner", panel).CornerRadius = UDim.new(0, 8)
 
@@ -2380,7 +2912,7 @@ do
 			state.clickX * 100, state.clickY * 100,
 			math.floor(state.clickX * vp.X + 0.5), math.floor(state.clickY * vp.Y + 0.5)
 		)
-		marker.Position = UDim2.fromOffset(state.clickX * vp.X, state.clickY * vp.Y)
+		M.marker.Position = UDim2.fromOffset(state.clickX * vp.X, state.clickY * vp.Y)
 		stepBtn.Text = ("Шаг %.1f%%"):format(POINT_STEPS[stepIndex] * 100)
 	end
 
@@ -2409,39 +2941,39 @@ do
 		refreshPoint()
 	end))
 
-	setPointPanel = function(open)
+	M.setPointPanel = function(open)
 		panel.Visible = open
-		marker.Visible = open
+		M.marker.Visible = open
 		pointBtn.Text = open and "Точка клика: скрыть ▲" or "Выбрать точку клика ▼"
 		if open then
 			refreshPoint()
 		end
 	end
-	setPointPanel(false)
+	M.setPointPanel(false)
 end
 
 -- ===== ПРИОРИТЕТ =====
 do
-	local p = pagePrio
+	local p = M.pagePrio
 	local MAX_ROWS = 60
 
-	addSection(p, "НАСТРОЙКИ")
-	addToggle(p, "Приоритет целей", function() return state.priorityEnabled end, function(v)
+	M.addSection(p, "НАСТРОЙКИ")
+	M.addToggle(p, "Приоритет целей", function() return state.priorityEnabled end, function(v)
 		state.priorityEnabled = v
 	end)
-	addNumber(p, "Уровень для новых", {
+	M.addNumber(p, "Уровень для новых", {
 		get = function() return state.newPriorityLevel end,
 		set = function(v) state.newPriorityLevel = v end,
 		step = 1, min = 1, max = 99, dec = 0,
 	})
-	addNote(p, "Больше число — выше приоритет. Приоритетная цель выбирается, даже если рядом есть другие. Работает в радиусе целей. Выше только отход и безопасная зона.", 66)
+	M.addNote(p, "Больше число — выше приоритет. Приоритетная цель выбирается, даже если рядом есть другие. Работает в радиусе целей. Выше только отход и безопасная зона.", 66)
 
-	addSection(p, "ПОИСК / ДОБАВИТЬ ПО ИМЕНИ")
+	M.addSection(p, "ПОИСК / ДОБАВИТЬ ПО ИМЕНИ")
 	local searchRow = Instance.new("Frame")
 	searchRow.Size = UDim2.new(1, 0, 0, 32)
 	searchRow.BackgroundColor3 = C.card
 	searchRow.BorderSizePixel = 0
-	searchRow.LayoutOrder = nextOrder(p)
+	searchRow.LayoutOrder = M.nextOrder(p)
 	searchRow.Parent = p.frame
 	Instance.new("UICorner", searchRow).CornerRadius = UDim.new(0, 8)
 
@@ -2465,17 +2997,37 @@ do
 	addBtn.Position = UDim2.new(1, -6, 0.5, 0)
 	addBtn.TextSize = 16
 
-	addButton(p, "Очистить непомеченные", C.btn, C.text, 28, function()
-		for k in pairs(seenNames) do
+	M.addButton(p, "Очистить непомеченные", C.btn, C.text, 28, function()
+		for k in pairs(M.seenNames) do
 			if not state.priorities[k] then
-				seenNames[k] = nil
+				M.seenNames[k] = nil
 			end
 		end
-		queueSave()
-		if refreshPriorityList then refreshPriorityList() end
+		M.queueSave()
+		if M.refreshPriorityList then M.refreshPriorityList() end
 	end)
 
-	local listHeader = addSection(p, "ЦЕЛИ  ( ● — сейчас рядом )")
+	M.addSection(p, "БОССЫ — ОСОБЫЙ МАРШРУТ")
+	M.addToggle(p, "The Undying Guardian", function() return state.bossGuardian end, function(v)
+		state.bossGuardian = v
+	end)
+	M.addToggle(p, "The Spooky Knight", function() return state.bossKnight end, function(v)
+		state.bossKnight = v
+	end)
+	M.addToggle(p, "Сначала подойти к боссу", function() return state.bossApproachFirst end, function(v)
+		state.bossApproachFirst = v
+	end)
+	M.addToggle(p, "Боссы — высший приоритет", function() return state.bossAutoPriority end, function(v)
+		state.bossAutoPriority = v
+	end)
+	M.addNumber(p, "Запас у зоны, м", {
+		get = function() return state.bossMargin end,
+		set = function(v) state.bossMargin = v end,
+		step = 1, min = 0, max = 60, dec = 0,
+	})
+	M.addNote(p, "Маршрут: подойти к боссу → уйти в зону и не выходить. Guardian: ждать в дальнем углу, пока босс не подойдёт к зоне. Knight: просто оставаться в зоне. Босс остаётся целью, пока жив. Чтобы босс выбирался, задай ему приоритет (список ниже) или включи «Боссы — высший приоритет».", 112)
+
+	local listHeader = M.addSection(p, "ЦЕЛИ  ( ● — сейчас рядом )")
 
 	-- строки списка (создаются/удаляются по мере необходимости)
 	local rows = {}
@@ -2496,8 +3048,8 @@ do
 		else
 			state.priorities[key] = math.clamp(math.floor(level + 0.5), 1, 99)
 		end
-		queueSave()
-		if refreshPriorityList then refreshPriorityList() end
+		M.queueSave()
+		if M.refreshPriorityList then M.refreshPriorityList() end
 	end
 
 	local function createRow(key)
@@ -2564,8 +3116,8 @@ do
 			local n = tonumber((box.Text:gsub(",", ".")))
 			if n then
 				setLevel(key, n)
-			elseif refreshPriorityList then
-				refreshPriorityList()
+			elseif M.refreshPriorityList then
+				M.refreshPriorityList()
 			end
 		end)
 		rows[key] = r
@@ -2574,9 +3126,9 @@ do
 	local function updateRow(key, rank)
 		local r = rows[key]
 		local level = state.priorities[key]
-		local present = presentNow[key]
+		local present = M.presentNow[key]
 		r.frame.LayoutOrder = 100 + rank
-		r.nameBtn.Text = (present and "● " or "   ") .. (seenNames[key] or key)
+		r.nameBtn.Text = (present and "● " or "   ") .. (M.seenNames[key] or key)
 		r.nameBtn.TextColor3 = level and C.yellow or (present and C.text or C.sub)
 		r.frame.BackgroundColor3 = level and Color3.fromRGB(46, 41, 20) or C.card
 		r.plus.Visible = level ~= nil
@@ -2587,10 +3139,10 @@ do
 		end
 	end
 
-	refreshPriorityList = function()
+	M.refreshPriorityList = function()
 		local filter = nameBox.Text:lower()
 		local keys = {}
-		for k in pairs(seenNames) do keys[k] = true end
+		for k in pairs(M.seenNames) do keys[k] = true end
 		for k in pairs(state.priorities) do keys[k] = true end
 
 		local list = {}
@@ -2602,7 +3154,7 @@ do
 		table.sort(list, function(a, b)
 			local la, lb = state.priorities[a] or 0, state.priorities[b] or 0
 			if la ~= lb then return la > lb end
-			local pa, pb = presentNow[a] and 1 or 0, presentNow[b] and 1 or 0
+			local pa, pb = M.presentNow[a] and 1 or 0, M.presentNow[b] and 1 or 0
 			if pa ~= pb then return pa > pb end
 			return a < b
 		end)
@@ -2628,13 +3180,13 @@ do
 		local raw = trim(nameBox.Text)
 		if raw == "" then return end
 		local key = raw:lower()
-		if not seenNames[key] then
-			seenNames[key] = raw
+		if not M.seenNames[key] then
+			M.seenNames[key] = raw
 		end
 		state.priorities[key] = state.newPriorityLevel
 		nameBox.Text = ""
-		queueSave()
-		refreshPriorityList()
+		M.queueSave()
+		M.refreshPriorityList()
 	end
 
 	track(addBtn.Activated:Connect(addByName))
@@ -2644,60 +3196,60 @@ do
 		end
 	end))
 	track(nameBox:GetPropertyChangedSignal("Text"):Connect(function()
-		refreshPriorityList()
+		M.refreshPriorityList()
 	end))
 
 	-- пока вкладка открыта, список обновляется раз в секунду
 	task.spawn(function()
 		while state.alive do
 			if p.frame.Visible then
-				pcall(refreshPriorityList)
+				pcall(M.refreshPriorityList)
 			end
 			task.wait(1)
 		end
 	end)
-	refreshPriorityList()
+	M.refreshPriorityList()
 end
 
 -- ===== СБРОС =====
 do
-	local p = pageReset
-	addSection(p, "РЕЖИМ СБРОСА ПЕРСОНАЖА")
-	addToggle(p, "Режим сброса", function() return state.resetEnabled end, function(v)
+	local p = M.pageReset
+	M.addSection(p, "РЕЖИМ СБРОСА ПЕРСОНАЖА")
+	M.addToggle(p, "Режим сброса", function() return state.resetEnabled end, function(v)
 		state.resetEnabled = v
-		goneCount = 0
-		if refreshResetInfo then refreshResetInfo() end
+		M.goneCount = 0
+		if M.refreshResetInfo then M.refreshResetInfo() end
 	end)
-	addNumber(p, "Пропаданий (N)", {
+	M.addNumber(p, "Пропаданий (N)", {
 		get = function() return state.resetEvery end,
 		set = function(v)
 			state.resetEvery = v
-			if refreshResetInfo then refreshResetInfo() end
+			if M.refreshResetInfo then M.refreshResetInfo() end
 		end,
 		step = 1, min = 1, max = 99, dec = 0,
 	})
-	addNumber(p, "Пауза 2-го ресета, с", {
+	M.addNumber(p, "Пауза 2-го ресета, с", {
 		get = function() return state.resetDelay end,
 		set = function(v) state.resetDelay = v end,
 		step = 0.5, min = 0.5, max = 60, dec = 1,
 	})
 
-	local info = addNote(p, "", 30)
+	local info = M.addNote(p, "", 30)
 	info.TextColor3 = C.text
-	refreshResetInfo = function()
+	M.refreshResetInfo = function()
 		info.Text = ("Пропаданий целей: %d / %d  •  циклов: %d%s"):format(
-			goneCount, state.resetEvery, cyclesDone, resetBusy and "  •  идёт сброс" or ""
+			M.goneCount, state.resetEvery, M.cyclesDone, M.resetBusy and "  •  идёт сброс" or ""
 		)
 	end
-	refreshResetInfo()
+	M.refreshResetInfo()
 
-	addButton(p, "Запустить цикл сейчас", C.btn, C.text, 32, function()
-		runResetCycle()
+	M.addButton(p, "Запустить цикл сейчас", C.btn, C.text, 32, function()
+		M.runResetCycle()
 	end)
-	addNote(p, "Каждые N пропаданий всех целей: первый ресет сразу, второй — через паузу.", 40)
+	M.addNote(p, "Каждые N пропаданий всех целей: первый ресет сразу, второй — через паузу.", 40)
 
-	addSection(p, "АВТО-СБРОС ФАРМА (FPS)")
-	addToggle(p, ("Сброс фарма: FPS ≤ %d (%d с)"):format(FPS_RESET_BELOW, FPS_LOW_SECONDS),
+	M.addSection(p, "АВТО-СБРОС ФАРМА (FPS)")
+	M.addToggle(p, ("Сброс фарма: FPS ≤ %d (%d с)"):format(M.FPS_RESET_BELOW, M.FPS_LOW_SECONDS),
 		function() return state.autoReset end, function(v)
 			state.autoReset = v
 		end)
@@ -2706,46 +3258,46 @@ end
 ------------------------------------------------------------
 -- События: кнопки главной вкладки, режим поиска, сворачивание
 ------------------------------------------------------------
-track(startBtn.Activated:Connect(start))
-track(stopBtn.Activated:Connect(stop))
-track(offBtn.Activated:Connect(shutdown))
-track(hdrOffBtn.Activated:Connect(shutdown))
-track(minBtn.Activated:Connect(function()
-	setMinimized(true)
+track(M.startBtn.Activated:Connect(M.start))
+track(M.stopBtn.Activated:Connect(M.stop))
+track(M.offBtn.Activated:Connect(M.shutdown))
+track(M.hdrOffBtn.Activated:Connect(M.shutdown))
+track(M.minBtn.Activated:Connect(function()
+	M.setMinimized(true)
 end))
 
-track(modeBtn.Activated:Connect(function()
-	if MODES_BY_ID[state.mode].needsQuery then
-		state.queries[state.mode] = queryBox.Text
+track(M.modeBtn.Activated:Connect(function()
+	if M.MODES_BY_ID[state.mode].needsQuery then
+		state.queries[state.mode] = M.queryBox.Text
 	end
 	local idx = 1
-	for i, m in ipairs(MODES) do
+	for i, m in ipairs(M.MODES) do
 		if m.id == state.mode then
 			idx = i
 			break
 		end
 	end
-	state.mode = MODES[(idx % #MODES) + 1].id
-	applyMode()
+	state.mode = M.MODES[(idx % #M.MODES) + 1].id
+	M.applyMode()
 end))
 
-track(queryBox:GetPropertyChangedSignal("Text"):Connect(function()
-	state.queries[state.mode] = queryBox.Text
+track(M.queryBox:GetPropertyChangedSignal("Text"):Connect(function()
+	state.queries[state.mode] = M.queryBox.Text
 end))
-track(queryBox.FocusLost:Connect(function()
-	state.queries[state.mode] = queryBox.Text
-	requestRefresh()
+track(M.queryBox.FocusLost:Connect(function()
+	state.queries[state.mode] = M.queryBox.Text
+	M.requestRefresh()
 end))
 
 ------------------------------------------------------------
 -- Смерть персонажа: подключаем к текущему и каждому новому персонажу
 ------------------------------------------------------------
 if player.Character then
-	task.spawn(hookCharacter, player.Character)
+	task.spawn(M.hookCharacter, player.Character)
 end
 track(player.CharacterAdded:Connect(function(char)
-	glideVel = Vector3.zero
-	task.spawn(hookCharacter, char)
+	M.glideVel = Vector3.zero
+	task.spawn(M.hookCharacter, char)
 end))
 
 ------------------------------------------------------------
@@ -2753,16 +3305,16 @@ end))
 ------------------------------------------------------------
 task.spawn(function()
 	while state.alive do
-		local root = getMyRoot()
+		local root = M.getMyRoot()
 		if root then
-			local target = findNearest(root.Position)
+			local target = M.findNearest(root.Position)
 			if target then
 				local lvl = state.priorities[target.key]
-				infoLabel.Text = ("%s%s · зазор %.1f м · целей %d"):format(
-					lvl and ("★" .. lvl .. " ") or "", target.name, edgeGap(target, root), #candidates
+				M.infoLabel.Text = ("%s%s · зазор %.1f м · целей %d"):format(
+					lvl and ("★" .. lvl .. " ") or "", target.name, M.edgeGap(target, root), #M.candidates
 				)
 			else
-				infoLabel.Text = searchNote or "Целей нет"
+				M.infoLabel.Text = M.searchNote or "Целей нет"
 			end
 		end
 		task.wait(0.3)
@@ -2772,7 +3324,7 @@ end)
 ------------------------------------------------------------
 -- АВТОЗАПУСК: режим «Авто (умный)», ходьба к цели и фарм включаются сразу
 ------------------------------------------------------------
-selectTab(1)
-applyMode()
-start()
-setFarm(true)
+M.selectTab(1)
+M.applyMode()
+M.start()
+M.setFarm(true)
