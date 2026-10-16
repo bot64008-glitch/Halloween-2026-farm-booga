@@ -1,5 +1,12 @@
 --[[
-    WEB VALLEY STUDIO — NPC Walker v17
+    WEB VALLEY STUDIO — NPC Walker v18
+
+    v18:
+      • Бан при бездействии: если персонаж не двигался N минут (по умолчанию 6), текущая цель,
+        которая была рядом всё это время, банится и пропускается до следующего «пропадания всех целей»
+        (за это время срабатывает обычный скип/счётчик сброса). Изменение HP цели считается активностью
+        (можно отключить). Вкладка ДВИЖ. → «ЗАЩИТА ОТ ПРИЗРАКОВ».
+      • Режим сброса: настраиваемое число ресетов в цикле (первый сразу, остальные через паузу).
 
     v17 — ИСПРАВЛЕНИЕ ЗАПУСКА: в v15–v16 меню не появлялось. Причина — слишком много локальных
     переменных в основном блоке (лимит Luau — 200). Теперь функции и переменные вынесены в таблицу M.
@@ -112,7 +119,8 @@ local state = {
 	-- сброс
 	resetEnabled = false,  -- режим сброса персонажа
 	resetEvery = 5,        -- каждые N пропаданий всех целей
-	resetDelay = 6.5,      -- пауза между первым и вторым ресетом (сек)
+	resetDelay = 6.5,      -- пауза между ресетами в цикле (сек)
+	resetPerCycle = 2,     -- сколько ресетов в одном цикле (первый сразу, остальные через паузу)
 	autoReset = true,      -- пересоздание кнопки фарма при низком FPS
 
 	-- приоритет целей
@@ -137,6 +145,11 @@ local state = {
 	bossApproachFirst = true, -- сначала подойти к боссу, потом в зону
 	bossAutoPriority = false, -- боссы с маршрутом — высший приоритет
 	bossMargin = 8,           -- насколько далеко за границей зоны босс ещё считается «рядом с зоной»
+
+	-- бездействие
+	idleBan = true,        -- банить цель, если персонаж не двигался
+	idleMinutes = 6,       -- сколько минут без движения
+	idleCountHp = true,    -- изменение HP цели считается активностью
 }
 
 local connections = {}
@@ -411,7 +424,11 @@ end
 
 -- временно игнорируемые («зависшие») цели: [inst] = os.clock() до которого игнорируем
 M.blacklist = setmetatable({}, { __mode = "k" })
+-- баны за бездействие: снимаются при следующем «пропадании всех целей»
+M.idleBans = setmetatable({}, { __mode = "k" })
+M.idleSkipEvents = 0
 function M.isBanned(c)
+	if M.idleBans[c.inst] then return true end
 	local ban = M.blacklist[c.inst]
 	return ban ~= nil and ban > os.clock()
 end
@@ -836,20 +853,23 @@ function M.resetCharacter()
 	return true
 end
 
--- цикл: первый ресет сразу, второй через state.resetDelay секунд
+-- цикл: state.resetPerCycle ресетов подряд — первый сразу, остальные через state.resetDelay секунд
 function M.runResetCycle()
 	if M.resetBusy or not state.alive then return end
 	M.resetBusy = true
 	M.cyclesDone += 1
 	if M.refreshResetInfo then M.refreshResetInfo() end
 	task.spawn(function()
-		M.resetCharacter() -- первый ресет
-		local t0 = os.clock()
-		while state.alive and os.clock() - t0 < state.resetDelay do
-			task.wait(0.1)
-		end
-		if state.alive then
-			M.resetCharacter() -- второй ресет
+		local total = math.max(1, math.floor(state.resetPerCycle + 0.5))
+		for i = 1, total do
+			if not state.alive then break end
+			M.resetCharacter()
+			if i < total then
+				local t0 = os.clock()
+				while state.alive and os.clock() - t0 < state.resetDelay do
+					task.wait(0.1)
+				end
+			end
 		end
 		M.resetBusy = false
 		if M.refreshResetInfo then M.refreshResetInfo() end
@@ -858,6 +878,16 @@ end
 
 -- вызывается один раз при каждом «пропадании всех целей»
 function M.onTargetsGone()
+	-- баны за бездействие снимаются при следующем «пропадании всех целей»
+	if next(M.idleBans) ~= nil then
+		if M.idleSkipEvents > 0 then
+			M.idleSkipEvents -= 1 -- это пропадание вызвано самим баном — баны пока остаются
+		else
+			for k in pairs(M.idleBans) do
+				M.idleBans[k] = nil
+			end
+		end
+	end
 	if not state.resetEnabled then return end
 	M.goneCount += 1
 	if M.goneCount >= state.resetEvery then
@@ -1550,7 +1580,7 @@ function M.watchLoop(gen)
 	local lastSkip = 0
 	local firstSkip = false
 	while state.alive and state.farm and gen == M.farmGen do
-		if (state.autoSkip or state.resetEnabled) and M.candidatesReady and not M.searchNote then
+		if (state.autoSkip or state.resetEnabled or next(M.idleBans) ~= nil) and M.candidatesReady and not M.searchNote then
 			local root = M.getMyRoot()
 			if root then
 				if M.hasTargetsInRadius(root.Position) then
@@ -1826,6 +1856,7 @@ function M.checkStuck(hum, root, dt, cond)
 end
 
 M.ghostTarget, M.ghostSince, M.ghostSig, M.ghostPos = nil, 0, nil, nil -- страж «у цели»
+M.lastMovePos, M.lastMoveAt, M.idleSig, M.idleTarget = nil, 0, nil, nil -- страж бездействия
 M.watchTarget = nil                -- цель, за которой следят стражи
 M.progBestGap, M.progSince = nil, 0  -- страж прогресса приближения
 M.visFailCount, M.animFailCount, M.lastGuardCheck = 0, 0, 0
@@ -1836,6 +1867,7 @@ M.bossEngaged, M.bossCorner, M.bossCornerAt = false, nil, 0
 
 function M.resetLatches()
 	M.ghostTarget = nil
+	M.lastMovePos, M.idleTarget = nil, nil
 	M.bossTarget, M.bossPhase, M.bossEngaged, M.bossCorner = nil, nil, false, nil
 	M.retreating = false
 	M.zoneActive = false
@@ -1976,6 +2008,22 @@ function M.banTarget(target, reason)
 	M.watchTarget = nil
 	M.progBestGap = nil
 	M.setStatus(("Пропущена цель %s: %s"):format(target.name, reason), C.yellow)
+end
+
+-- бан за бездействие: цель игнорируется до следующего «пропадания всех целей»
+function M.idleBanTarget(target)
+	M.idleBans[target.inst] = true
+	M.idleSkipEvents = 1
+	local reason = ("бездействие %s мин — пропущена до пропажи всех целей"):format(tostring(state.idleMinutes))
+	table.insert(M.banLog, 1, { name = target.name, reason = reason, dump = M.describeTarget(target) })
+	if #M.banLog > 5 then
+		table.remove(M.banLog)
+	end
+	M.currentTarget = nil
+	M.ghostTarget = nil
+	M.watchTarget = nil
+	M.progBestGap = nil
+	M.setStatus(("Бездействие: пропущена цель %s"):format(target.name), C.yellow)
 end
 
 -- быстрые проверки текущей цели; возвращает причину или nil
@@ -2137,6 +2185,34 @@ local function step(dt)
 			M.banTarget(target, reason)
 			target = nil
 		end
+	end
+
+	-- бездействие: персонаж не двигался state.idleMinutes минут, а цель всё это время одна и та же
+	-- -> цель банится до пропадания всех целей (изменение HP цели считается активностью)
+	if state.idleBan then
+		local rp = root.Position
+		if M.lastMovePos == nil or (rp - M.lastMovePos).Magnitude > 1.0 then
+			M.lastMovePos = rp
+			M.lastMoveAt = now
+		end
+		if target ~= M.idleTarget then
+			M.idleTarget = target -- цель сменилась (или пропала) — отсчёт заново
+			M.lastMoveAt = now
+		end
+		if state.idleCountHp and target then
+			local sig = M.hpSignature(target.inst)
+			if sig ~= M.idleSig then
+				M.idleSig = sig
+				M.lastMoveAt = now
+			end
+		end
+		if target and now - M.lastMoveAt >= state.idleMinutes * 60 then
+			M.idleBanTarget(target)
+			target = nil
+			M.lastMoveAt = now
+		end
+	else
+		M.lastMovePos = nil
 	end
 
 	-- безопасная зона: включаем при HP <= zoneHp, снимаем когда пропали все цели
@@ -2714,6 +2790,20 @@ do
 		step = 1, min = 3, max = 120, dec = 0,
 	})
 
+	M.addToggle(p, "Бан при бездействии", function() return state.idleBan end, function(v)
+		state.idleBan = v
+		M.lastMovePos = nil
+	end)
+	M.addNumber(p, "Бездействие, мин", {
+		get = function() return state.idleMinutes end,
+		set = function(v) state.idleMinutes = v end,
+		step = 0.5, min = 0.5, max = 120, dec = 1,
+	})
+	M.addToggle(p, "HP цели = активность", function() return state.idleCountHp end, function(v)
+		state.idleCountHp = v
+	end)
+	M.addNote(p, "Если персонаж не двигался столько минут, текущая цель пропускается до пропажи всех целей.", 40)
+
 	M.addSection(p, "ДИАГНОСТИКА ЦЕЛИ")
 	local diagLabel = Instance.new("TextLabel")
 	diagLabel.BackgroundColor3 = C.card
@@ -3228,7 +3318,12 @@ do
 		end,
 		step = 1, min = 1, max = 99, dec = 0,
 	})
-	M.addNumber(p, "Пауза 2-го ресета, с", {
+	M.addNumber(p, "Ресетов в цикле", {
+		get = function() return state.resetPerCycle end,
+		set = function(v) state.resetPerCycle = v end,
+		step = 1, min = 1, max = 20, dec = 0,
+	})
+	M.addNumber(p, "Пауза ресетов, с", {
 		get = function() return state.resetDelay end,
 		set = function(v) state.resetDelay = v end,
 		step = 0.5, min = 0.5, max = 60, dec = 1,
@@ -3246,7 +3341,7 @@ do
 	M.addButton(p, "Запустить цикл сейчас", C.btn, C.text, 32, function()
 		M.runResetCycle()
 	end)
-	M.addNote(p, "Каждые N пропаданий всех целей: первый ресет сразу, второй — через паузу.", 40)
+	M.addNote(p, "Каждые N пропаданий всех целей: цикл из нескольких ресетов — первый сразу, остальные через паузу.", 52)
 
 	M.addSection(p, "АВТО-СБРОС ФАРМА (FPS)")
 	M.addToggle(p, ("Сброс фарма: FPS ≤ %d (%d с)"):format(M.FPS_RESET_BELOW, M.FPS_LOW_SECONDS),
