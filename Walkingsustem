@@ -1,18 +1,20 @@
 --[[
-    WEB VALLEY STUDIO — NPC Walker v15
+    WEB VALLEY STUDIO — NPC Walker v16
 
-    Что нового в v15 (защита от «призрачных» целей — несколько уровней):
-      1) События смерти: Humanoid.Died / HealthChanged / изменение HP-атрибутов / Destroying /
-         уход модели из workspace — цель считается мёртвой мгновенно.
-      2) Цель вне карты (NaN или ниже FallenPartsDestroyHeight).
-      3) Цель невидима: у модели нет видимых частей (все прозрачные).
-      4) Страж прогресса: зазор до цели не уменьшается N секунд — цель пропускается (недоступна).
-      5) Страж «у цели»: стоим рядом, а HP/позиция цели не меняются — пропуск
-         (если у цели нет данных о HP — ждём вдвое дольше).
-      6) Проверка анимаций (эксперимент, по умолчанию выключена).
-      • Диагностика: кнопки «Снимок цели» / «Последний бан» / «Копировать» (вкладка ДВИЖ.)
-        показывают подробные данные о цели и причину пропуска — их можно прислать для точной починки.
-    Остальное — как в v14 (приоритеты, вид сверху, ручной ввод чисел, сброс и т.д.).
+    Что нового в v16 — особые маршруты боссов (настройки: вкладка ПРИОР., раздел «БОССЫ»):
+
+      The Undying Guardian:
+        1) подойти к боссу и сразу уйти в безопасную зону;
+        2) в зоне, не выходя из неё, встать в ДАЛЬНИЙ от босса угол и ждать,
+           пока босс не окажется в зоне или чуть дальше её границы (настраиваемый запас);
+        3) тогда подойти к боссу, всё ещё не выходя из зоны; если босс снова ушёл — обратно в угол;
+        4) так до тех пор, пока босс не пропадёт. После этого — обычные паттерны, пока он не появится снова.
+
+      The Spooky Knight: то же самое, но без дальнего угла — достаточно не выходить из зоны
+        и подходить к боссу, когда он в зоне или рядом с ней.
+
+      Босс «залипает» как цель, пока жив. Отход и безопасная зона по HP по-прежнему важнее маршрута.
+      Раньше: защита от «призрачных» целей, приоритеты, вид сверху, ручной ввод чисел, сброс и т.д.
 ]]
 
 local Players = game:GetService("Players")
@@ -119,6 +121,13 @@ local state = {
 	visCheck = true,       -- цель невидима
 	progressCheck = true,  -- нет прогресса в приближении
 	animCheck = false,     -- нет анимаций (эксперимент)
+
+	-- боссы с особым маршрутом
+	bossGuardian = true,      -- The Undying Guardian
+	bossKnight = true,        -- The Spooky Knight
+	bossApproachFirst = true, -- сначала подойти к боссу, потом в зону
+	bossAutoPriority = false, -- боссы с маршрутом — высший приоритет
+	bossMargin = 8,           -- насколько далеко за границей зоны босс ещё считается «рядом с зоной»
 }
 
 local connections = {}
@@ -622,8 +631,27 @@ onCandidatesUpdated = function()
 	if changed then queueSave() end
 end
 
+-- боссы с особым маршрутом (имя ищется по части, без учёта регистра)
+local BOSS_GUARDIAN = { corner = true, name = "The Undying Guardian" }
+local BOSS_KNIGHT = { corner = false, name = "The Spooky Knight" }
+
+local function bossSpec(c)
+	if not c then return nil end
+	local k = c.key
+	if state.bossGuardian and k:find("undying guardian", 1, true) then
+		return BOSS_GUARDIAN
+	end
+	if state.bossKnight and k:find("spooky knight", 1, true) then
+		return BOSS_KNIGHT
+	end
+	return nil
+end
+
 -- уровень приоритета цели (0 — обычная). Действует только в радиусе farmRadius
 local function priorityLevel(c, d)
+	if state.bossAutoPriority and d <= state.farmRadius and bossSpec(c) then
+		return 100
+	end
 	if not state.priorityEnabled or d > state.farmRadius then
 		return 0
 	end
@@ -1793,8 +1821,13 @@ local watchTarget = nil                -- цель, за которой след
 local progBestGap, progSince = nil, 0  -- страж прогресса приближения
 local visFailCount, animFailCount, lastGuardCheck = 0, 0, 0
 
+-- маршрут босса
+local bossTarget, bossPhase, bossPhaseSince, bossLimit = nil, nil, 0, 0 -- фаза: "approach" -> "hold"
+local bossEngaged, bossCorner, bossCornerAt = false, nil, 0
+
 local function resetLatches()
 	ghostTarget = nil
+	bossTarget, bossPhase, bossEngaged, bossCorner = nil, nil, false, nil
 	retreating = false
 	zoneActive = false
 	zoneArmed = true
@@ -1971,6 +2004,77 @@ local function guardTarget(target, now)
 	return nil
 end
 
+------------------------------------------------------------
+-- Маршрут боссов: геометрия зоны и скольжение к точке
+------------------------------------------------------------
+local BOSS_APPROACH_BASE = 15  -- запас времени на «подойти к боссу» (плюс время пути)
+local BOSS_HYST = 4            -- гистерезис «рядом с зоной» (студы)
+
+-- расстояние от точки до зоны (0 — внутри)
+local function zoneDistance(p)
+	if pointInZone(p) then return 0 end
+	local best
+	for i = 1, #ZONE_POINTS do
+		local a = ZONE_POINTS[i]
+		local b = ZONE_POINTS[(i % #ZONE_POINTS) + 1]
+		local c = closestOnSegment(p, a, b)
+		local d = math.sqrt((c.X - p.X) ^ 2 + (c.Z - p.Z) ^ 2)
+		if not best or d < best then
+			best = d
+		end
+	end
+	return best
+end
+
+-- ближайшая к p точка внутри зоны
+local function clampToZone(p)
+	if pointInZone(p) then
+		return Vector3.new(p.X, 0, p.Z)
+	end
+	return zoneGoalPoint(p)
+end
+
+local function flatDist(a, b)
+	return math.sqrt((a.X - b.X) ^ 2 + (a.Z - b.Z) ^ 2)
+end
+
+-- самый дальний от цели угол зоны (индекс) и расстояние до него
+local function farCornerIndex(tpos)
+	local bestI, bestD
+	for i, pt in ipairs(ZONE_POINTS) do
+		local d = flatDist(pt, tpos)
+		if not bestD or d > bestD then
+			bestI, bestD = i, d
+		end
+	end
+	return bestI, bestD
+end
+
+-- точка чуть внутри зоны у угла
+local function cornerPoint(i)
+	local pt = ZONE_POINTS[i]
+	local flatPt = Vector3.new(pt.X, 0, pt.Z)
+	local toCenter = ZONE_CENTER - flatPt
+	if toCenter.Magnitude < 0.01 then return flatPt end
+	return flatPt + toCenter.Unit * math.min(ZONE_INSET + 0.5, toCenter.Magnitude)
+end
+
+-- плавно скользим к точке; возвращает true, если уже на месте
+local function glideToPoint(hum, root, goal, dt)
+	local p = root.Position
+	local to = Vector3.new(goal.X - p.X, 0, goal.Z - p.Z)
+	local dist = to.Magnitude
+	if dist < 0.6 then
+		hum:Move(Vector3.zero, false)
+		applyGlide(root, Vector3.zero, dt)
+		return true
+	end
+	local dir = to.Unit
+	hum:Move(dir, false)
+	applyGlide(root, dir * approachSpeed(dist), dt)
+	return false
+end
+
 local function step(dt)
 	if not (state.alive and state.running) then return end
 
@@ -2002,7 +2106,8 @@ local function step(dt)
 
 	-- ближайший NPC (пересчёт несколько раз в секунду или сразу, если цель пропала)
 	local now = os.clock()
-	if not targetValid(currentTarget) or now - lastRetarget > 0.15 then
+	local bossLocked = bossSpec(currentTarget) ~= nil -- босс «залипает»: не переключаемся, пока он жив
+	if not targetValid(currentTarget) or (not bossLocked and now - lastRetarget > 0.15) then
 		currentTarget = findNearest(root.Position)
 		lastRetarget = now
 	end
@@ -2144,7 +2249,94 @@ local function step(dt)
 		return
 	end
 
-	-- 3) Обычное движение к цели
+	-- 3) Особый маршрут боссов (The Undying Guardian / The Spooky Knight)
+	local spec = bossSpec(target)
+	if spec then
+		if bossTarget ~= target then
+			bossTarget = target
+			bossEngaged = false
+			bossCorner = nil
+			bossPhaseSince = now
+			if state.bossApproachFirst then
+				bossPhase = "approach"
+				local d = (target.root.Position - root.Position).Magnitude
+				bossLimit = BOSS_APPROACH_BASE + (d / math.max(state.glideSpeed, 1)) * 1.5
+			else
+				bossPhase = "hold"
+			end
+		end
+		if bossPhase == "approach" and now - bossPhaseSince > bossLimit then
+			bossPhase = "hold" -- не дошли за отведённое время — всё равно уходим в зону
+		end
+
+		if bossPhase == "hold" then
+			progBestGap = nil
+			ghostTarget = nil
+			local p = root.Position
+			local tpos = target.root.Position
+
+			-- всегда остаёмся в зоне; если вышли — возвращаемся
+			if not pointInZone(p) then
+				glideToPoint(hum, root, zoneGoalPoint(p), dt)
+				setStatus("Босс: иду в зону", C.yellow)
+				checkStuck(hum, root, dt, true)
+				return
+			end
+
+			-- босс в зоне или рядом с ней? (с гистерезисом, чтобы не дёргаться на границе)
+			local zd = zoneDistance(tpos)
+			local near
+			if bossEngaged then
+				near = zd <= state.bossMargin + BOSS_HYST
+			else
+				near = zd <= state.bossMargin
+			end
+			bossEngaged = near
+
+			if near then
+				-- подходим к боссу, не выходя из зоны
+				if edgeGap(target, root) <= state.stopDist then
+					hum:Move(Vector3.zero, false)
+					applyGlide(root, Vector3.zero, dt)
+					stuckTime = 0
+					setStatus("Босс: бью из зоны", C.yellow)
+				else
+					glideToPoint(hum, root, clampToZone(tpos), dt)
+					setStatus("Босс: подхожу из зоны", C.yellow)
+					checkStuck(hum, root, dt, true)
+				end
+				return
+			end
+
+			-- босс далеко от зоны
+			if spec.corner then
+				-- Undying Guardian: ждём в самом дальнем от него углу
+				if not bossCorner or now - bossCornerAt > 1.5 then
+					local idx, d = farCornerIndex(tpos)
+					if not bossCorner then
+						bossCorner = idx
+					elseif idx ~= bossCorner and d > flatDist(ZONE_POINTS[bossCorner], tpos) + 6 then
+						bossCorner = idx -- меняем угол только если новый заметно дальше
+					end
+					bossCornerAt = now
+				end
+				glideToPoint(hum, root, cornerPoint(bossCorner), dt)
+				setStatus("Босс: жду в дальнем углу", C.yellow)
+			else
+				-- Spooky Knight: просто стоим в зоне
+				hum:Move(Vector3.zero, false)
+				applyGlide(root, Vector3.zero, dt)
+				stuckTime = 0
+				setStatus("Босс: жду в зоне", C.yellow)
+			end
+			return
+		end
+		-- фаза "approach": обычное движение к боссу ниже
+	else
+		bossTarget, bossPhase = nil, nil
+	end
+
+	-- 4) Обычное движение к цели
 	local gap = edgeGap(target, root)
 	local remaining = gap - state.stopDist
 
@@ -2153,6 +2345,9 @@ local function step(dt)
 		applyGlide(root, Vector3.zero, dt)
 		stuckTime = 0
 		progBestGap = nil
+		if bossPhase == "approach" then
+			bossPhase = "hold" -- дошли до босса — сразу уходим в зону
+		end
 		setStatus("У цели: " .. target.name, C.text)
 
 		-- страж «у цели»: HP не меняется и цель не двигается -> «призрак»
@@ -2802,6 +2997,26 @@ do
 		queueSave()
 		if refreshPriorityList then refreshPriorityList() end
 	end)
+
+	addSection(p, "БОССЫ — ОСОБЫЙ МАРШРУТ")
+	addToggle(p, "The Undying Guardian", function() return state.bossGuardian end, function(v)
+		state.bossGuardian = v
+	end)
+	addToggle(p, "The Spooky Knight", function() return state.bossKnight end, function(v)
+		state.bossKnight = v
+	end)
+	addToggle(p, "Сначала подойти к боссу", function() return state.bossApproachFirst end, function(v)
+		state.bossApproachFirst = v
+	end)
+	addToggle(p, "Боссы — высший приоритет", function() return state.bossAutoPriority end, function(v)
+		state.bossAutoPriority = v
+	end)
+	addNumber(p, "Запас у зоны, м", {
+		get = function() return state.bossMargin end,
+		set = function(v) state.bossMargin = v end,
+		step = 1, min = 0, max = 60, dec = 0,
+	})
+	addNote(p, "Маршрут: подойти к боссу → уйти в зону и не выходить. Guardian: ждать в дальнем углу, пока босс не подойдёт к зоне. Knight: просто оставаться в зоне. Босс остаётся целью, пока жив. Чтобы босс выбирался, задай ему приоритет (список ниже) или включи «Боссы — высший приоритет».", 112)
 
 	local listHeader = addSection(p, "ЦЕЛИ  ( ● — сейчас рядом )")
 
