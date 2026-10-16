@@ -1,20 +1,16 @@
 --[[
-    WEB VALLEY STUDIO — NPC Walker v16
+    WEB VALLEY STUDIO — NPC Walker v14
 
-    Что нового в v16 — особые маршруты боссов (настройки: вкладка ПРИОР., раздел «БОССЫ»):
-
-      The Undying Guardian:
-        1) подойти к боссу и сразу уйти в безопасную зону;
-        2) в зоне, не выходя из неё, встать в ДАЛЬНИЙ от босса угол и ждать,
-           пока босс не окажется в зоне или чуть дальше её границы (настраиваемый запас);
-        3) тогда подойти к боссу, всё ещё не выходя из зоны; если босс снова ушёл — обратно в угол;
-        4) так до тех пор, пока босс не пропадёт. После этого — обычные паттерны, пока он не появится снова.
-
-      The Spooky Knight: то же самое, но без дальнего угла — достаточно не выходить из зоны
-        и подходить к боссу, когда он в зоне или рядом с ней.
-
-      Босс «залипает» как цель, пока жив. Отход и безопасная зона по HP по-прежнему важнее маршрута.
-      Раньше: защита от «призрачных» целей, приоритеты, вид сверху, ручной ввод чисел, сброс и т.д.
+    Что нового в v14:
+      • Исправление «зависших» целей: труп без Humanoid, своя система HP, флаги смерти,
+        цель вне карты — теперь считаются мёртвыми. Плюс страж: цель, у которой HP не меняется
+        и которая не двигается, пока мы стоим рядом, временно пропускается.
+      • Клавиши 2 → 1 после смерти надёжнее: дольше удержание, ждём пока персонаж жив, повторы.
+      • Кнопка «ВИД СВЕРХУ» (ГЛАВНАЯ): камера на N студов выше и смотрит на игрока.
+      • Вкладка «ПРИОР.»: список замеченных целей (имена сохраняются), приоритет и уровень,
+        поиск/добавление по имени. Приоритетная цель выбирается даже если рядом есть другие.
+        Выше приоритета только отход и безопасная зона.
+      • Скорость меняется на 1, а любое число можно вписать вручную.
 ]]
 
 local Players = game:GetService("Players")
@@ -47,7 +43,6 @@ local GLIDE_K = 8                -- плавность торможения у �
 local GLIDE_MIN_SPEED = 2        -- минимальная скорость при подходе (студы/сек)
 
 local GHOST_BAN_SECONDS = 30   -- на сколько секунд игнорируем «зависшую» цель
-local DEAD_MEMORY = 20         -- сколько секунд помним, что цель умерла (потом проверяем заново)
 local SKIP_COOLDOWN = 2          -- пауза между повторами Skip
 local EMPTY_DEBOUNCE = 0.5       -- цели должны отсутствовать N сек, чтобы считаться «пропавшими»
 
@@ -114,20 +109,8 @@ local state = {
 	-- камера и зависшие цели
 	topView = false,       -- вид сверху
 	topViewHeight = 20,    -- высота камеры над игроком
-	ghostFilter = true,    -- страж «у цели»: HP/позиция не меняются
-	ghostSeconds = 12,     -- сколько секунд ждать до пропуска цели (стражи прогресса и «у цели»)
-	deathEvents = true,    -- следить за событиями смерти цели
-	posCheck = true,       -- цель вне карты
-	visCheck = true,       -- цель невидима
-	progressCheck = true,  -- нет прогресса в приближении
-	animCheck = false,     -- нет анимаций (эксперимент)
-
-	-- боссы с особым маршрутом
-	bossGuardian = true,      -- The Undying Guardian
-	bossKnight = true,        -- The Spooky Knight
-	bossApproachFirst = true, -- сначала подойти к боссу, потом в зону
-	bossAutoPriority = false, -- боссы с маршрутом — высший приоритет
-	bossMargin = 8,           -- насколько далеко за границей зоны босс ещё считается «рядом с зоной»
+	ghostFilter = true,    -- пропускать «зависшие» цели
+	ghostSeconds = 12,     -- сколько секунд цель без изменений рядом с нами считается зависшей
 }
 
 local connections = {}
@@ -386,15 +369,10 @@ local function makeCandidate(inst)
 	}
 end
 
--- метки смерти от событий: [inst] = os.clock() момента смерти (помним DEAD_MEMORY секунд)
-local deadSet = setmetatable({}, { __mode = "k" })
-
 -- цель жива и по-прежнему на карте (учитываем и пропавший Humanoid — «труп»)
 local function candAlive(c)
 	local inst = c.inst
 	if not inst.Parent or not c.root.Parent then return false end
-	local dsince = deadSet[inst]
-	if dsince and os.clock() - dsince < DEAD_MEMORY then return false end
 	local hum = c.hum
 	if hum and not hum:IsDescendantOf(inst) then return false end
 	return isAlive(inst)
@@ -631,27 +609,8 @@ onCandidatesUpdated = function()
 	if changed then queueSave() end
 end
 
--- боссы с особым маршрутом (имя ищется по части, без учёта регистра)
-local BOSS_GUARDIAN = { corner = true, name = "The Undying Guardian" }
-local BOSS_KNIGHT = { corner = false, name = "The Spooky Knight" }
-
-local function bossSpec(c)
-	if not c then return nil end
-	local k = c.key
-	if state.bossGuardian and k:find("undying guardian", 1, true) then
-		return BOSS_GUARDIAN
-	end
-	if state.bossKnight and k:find("spooky knight", 1, true) then
-		return BOSS_KNIGHT
-	end
-	return nil
-end
-
 -- уровень приоритета цели (0 — обычная). Действует только в радиусе farmRadius
 local function priorityLevel(c, d)
-	if state.bossAutoPriority and d <= state.farmRadius and bossSpec(c) then
-		return 100
-	end
 	if not state.priorityEnabled or d > state.farmRadius then
 		return 0
 	end
@@ -1816,263 +1775,15 @@ local function checkStuck(hum, root, dt, cond)
 	end
 end
 
-local ghostTarget, ghostSince, ghostSig, ghostPos = nil, 0, nil, nil -- страж «у цели»
-local watchTarget = nil                -- цель, за которой следят стражи
-local progBestGap, progSince = nil, 0  -- страж прогресса приближения
-local visFailCount, animFailCount, lastGuardCheck = 0, 0, 0
-
--- маршрут босса
-local bossTarget, bossPhase, bossPhaseSince, bossLimit = nil, nil, 0, 0 -- фаза: "approach" -> "hold"
-local bossEngaged, bossCorner, bossCornerAt = false, nil, 0
+local ghostTarget, ghostSince, ghostSig, ghostPos = nil, 0, nil, nil -- страж «зависших» целей
 
 local function resetLatches()
 	ghostTarget = nil
-	bossTarget, bossPhase, bossEngaged, bossCorner = nil, nil, false, nil
 	retreating = false
 	zoneActive = false
 	zoneArmed = true
 	noTargetTime = 0
 	zoneRecoverTime = 0
-end
-
-------------------------------------------------------------
--- Защита от «призрачных» целей
-------------------------------------------------------------
-local hookConns = {}
-local hooked = setmetatable({}, { __mode = "k" })
-local banLog = {}
-
--- события смерти для цели, за которой идём
-local function hookInst(inst, hum)
-	if hooked[inst] then return end
-	if #hookConns > 300 then
-		for _, c in ipairs(hookConns) do
-			pcall(function() c:Disconnect() end)
-		end
-		table.clear(hookConns)
-		table.clear(hooked)
-	end
-	hooked[inst] = true
-	local function add(conn)
-		hookConns[#hookConns + 1] = conn
-	end
-	add(inst.AncestryChanged:Connect(function()
-		if inst:IsDescendantOf(workspace) then
-			deadSet[inst] = nil -- вернулся на карту (пул) — снова живой
-		else
-			deadSet[inst] = os.clock()
-		end
-	end))
-	add(inst.Destroying:Connect(function()
-		deadSet[inst] = os.clock()
-	end))
-	if hum then
-		add(hum.Died:Connect(function()
-			deadSet[inst] = os.clock()
-		end))
-		add(hum.HealthChanged:Connect(function(h)
-			if h <= 0 then
-				deadSet[inst] = os.clock()
-			else
-				deadSet[inst] = nil
-			end
-		end))
-	end
-	for _, n in ipairs(HP_NAMES) do
-		add(inst:GetAttributeChangedSignal(n):Connect(function()
-			local a = inst:GetAttribute(n)
-			if type(a) == "number" then
-				deadSet[inst] = (a <= 0) and os.clock() or nil
-			end
-		end))
-	end
-end
-
--- есть ли у модели хоть одна видимая часть
-local function hasVisibleParts(inst)
-	if inst:IsA("BasePart") then
-		return inst.Transparency < 0.95
-	end
-	for _, d in ipairs(inst:GetDescendants()) do
-		if d:IsA("BasePart") and d.Name ~= "HumanoidRootPart" and d.Transparency < 0.95 then
-			return true
-		end
-	end
-	return false
-end
-
--- проигрываются ли анимации: true / false, nil — если Animator не найден
-local function animActive(inst)
-	local ok, res = pcall(function()
-		local animator = inst:FindFirstChildWhichIsA("Animator", true)
-		if not animator then return nil end
-		return #animator:GetPlayingAnimationTracks() > 0
-	end)
-	if ok then return res end
-	return nil
-end
-
--- подробное описание цели (для диагностики)
-local function describeTarget(c)
-	local lines = {}
-	local function add(text)
-		lines[#lines + 1] = text
-	end
-	pcall(function()
-		local inst = c.inst
-		add(("Имя: %s (%s)"):format(inst.Name, inst.ClassName))
-		add("Путь: " .. inst:GetFullName())
-		add("В workspace: " .. tostring(inst:IsDescendantOf(workspace)))
-		local hum = inst:FindFirstChildOfClass("Humanoid")
-		if hum then
-			add(("Humanoid: HP %.1f / %.1f, состояние %s"):format(hum.Health, hum.MaxHealth, tostring(hum:GetState())))
-		else
-			add("Humanoid: нет" .. (c.hum and " (был при поиске!)" or ""))
-		end
-		add("HP-данные: " .. tostring(hpSignature(inst)))
-		local attrs = {}
-		for k, v in pairs(inst:GetAttributes()) do
-			attrs[#attrs + 1] = k .. "=" .. tostring(v)
-		end
-		add("Атрибуты: " .. (#attrs > 0 and table.concat(attrs, ", ") or "нет"))
-		local kids = {}
-		for i, ch in ipairs(inst:GetChildren()) do
-			if i > 25 then
-				kids[#kids + 1] = "..."
-				break
-			end
-			kids[#kids + 1] = ch.Name .. ":" .. ch.ClassName
-		end
-		add("Дети: " .. table.concat(kids, ", "))
-		local r = c.root
-		add(("Root: %s, поз %s, Anchored=%s"):format(r.Name, tostring(r.Position), tostring(r.Anchored)))
-		add("Видимые части: " .. tostring(hasVisibleParts(inst)))
-		add("Анимации идут: " .. tostring(animActive(inst)))
-		add(("candAlive=%s, isAlive=%s, deadSet=%s, banned=%s"):format(
-			tostring(candAlive(c)), tostring(isAlive(inst)), tostring(deadSet[inst] ~= nil), tostring(isBanned(c))
-		))
-	end)
-	return table.concat(lines, "\n")
-end
-
--- временно пропускаем цель и записываем причину + снимок
-local function banTarget(target, reason)
-	blacklist[target.inst] = os.clock() + GHOST_BAN_SECONDS
-	table.insert(banLog, 1, { name = target.name, reason = reason, dump = describeTarget(target) })
-	if #banLog > 5 then
-		table.remove(banLog)
-	end
-	currentTarget = nil
-	ghostTarget = nil
-	watchTarget = nil
-	progBestGap = nil
-	setStatus(("Пропущена цель %s: %s"):format(target.name, reason), C.yellow)
-end
-
--- быстрые проверки текущей цели; возвращает причину или nil
-local function guardTarget(target, now)
-	local inst, troot = target.inst, target.root
-	if state.posCheck then
-		local pos = troot.Position
-		if pos ~= pos or pos.Y < workspace.FallenPartsDestroyHeight + 10 then
-			return "позиция цели вне карты"
-		end
-	end
-	if now - lastGuardCheck >= 0.5 then
-		lastGuardCheck = now
-		if state.visCheck then
-			if hasVisibleParts(inst) then
-				visFailCount = 0
-			else
-				visFailCount += 1
-				if visFailCount >= 3 then
-					return "у цели нет видимых частей"
-				end
-			end
-		end
-		if state.animCheck then
-			if animActive(inst) == false then
-				animFailCount += 1
-				if animFailCount >= 6 then
-					return "нет проигрываемых анимаций (3 с)"
-				end
-			else
-				animFailCount = 0
-			end
-		end
-	end
-	return nil
-end
-
-------------------------------------------------------------
--- Маршрут боссов: геометрия зоны и скольжение к точке
-------------------------------------------------------------
-local BOSS_APPROACH_BASE = 15  -- запас времени на «подойти к боссу» (плюс время пути)
-local BOSS_HYST = 4            -- гистерезис «рядом с зоной» (студы)
-
--- расстояние от точки до зоны (0 — внутри)
-local function zoneDistance(p)
-	if pointInZone(p) then return 0 end
-	local best
-	for i = 1, #ZONE_POINTS do
-		local a = ZONE_POINTS[i]
-		local b = ZONE_POINTS[(i % #ZONE_POINTS) + 1]
-		local c = closestOnSegment(p, a, b)
-		local d = math.sqrt((c.X - p.X) ^ 2 + (c.Z - p.Z) ^ 2)
-		if not best or d < best then
-			best = d
-		end
-	end
-	return best
-end
-
--- ближайшая к p точка внутри зоны
-local function clampToZone(p)
-	if pointInZone(p) then
-		return Vector3.new(p.X, 0, p.Z)
-	end
-	return zoneGoalPoint(p)
-end
-
-local function flatDist(a, b)
-	return math.sqrt((a.X - b.X) ^ 2 + (a.Z - b.Z) ^ 2)
-end
-
--- самый дальний от цели угол зоны (индекс) и расстояние до него
-local function farCornerIndex(tpos)
-	local bestI, bestD
-	for i, pt in ipairs(ZONE_POINTS) do
-		local d = flatDist(pt, tpos)
-		if not bestD or d > bestD then
-			bestI, bestD = i, d
-		end
-	end
-	return bestI, bestD
-end
-
--- точка чуть внутри зоны у угла
-local function cornerPoint(i)
-	local pt = ZONE_POINTS[i]
-	local flatPt = Vector3.new(pt.X, 0, pt.Z)
-	local toCenter = ZONE_CENTER - flatPt
-	if toCenter.Magnitude < 0.01 then return flatPt end
-	return flatPt + toCenter.Unit * math.min(ZONE_INSET + 0.5, toCenter.Magnitude)
-end
-
--- плавно скользим к точке; возвращает true, если уже на месте
-local function glideToPoint(hum, root, goal, dt)
-	local p = root.Position
-	local to = Vector3.new(goal.X - p.X, 0, goal.Z - p.Z)
-	local dist = to.Magnitude
-	if dist < 0.6 then
-		hum:Move(Vector3.zero, false)
-		applyGlide(root, Vector3.zero, dt)
-		return true
-	end
-	local dir = to.Unit
-	hum:Move(dir, false)
-	applyGlide(root, dir * approachSpeed(dist), dt)
-	return false
 end
 
 local function step(dt)
@@ -2106,29 +1817,11 @@ local function step(dt)
 
 	-- ближайший NPC (пересчёт несколько раз в секунду или сразу, если цель пропала)
 	local now = os.clock()
-	local bossLocked = bossSpec(currentTarget) ~= nil -- босс «залипает»: не переключаемся, пока он жив
-	if not targetValid(currentTarget) or (not bossLocked and now - lastRetarget > 0.15) then
+	if not targetValid(currentTarget) or now - lastRetarget > 0.15 then
 		currentTarget = findNearest(root.Position)
 		lastRetarget = now
 	end
 	local target = currentTarget
-
-	-- слежение за целью: подписка на события смерти и проверки «призрака»
-	if target then
-		if target ~= watchTarget then
-			watchTarget = target
-			progBestGap, progSince, visFailCount, animFailCount = nil, now, 0, 0
-			ghostTarget = nil
-			if state.deathEvents then
-				hookInst(target.inst, target.hum)
-			end
-		end
-		local reason = guardTarget(target, now)
-		if reason then
-			banTarget(target, reason)
-			target = nil
-		end
-	end
 
 	-- безопасная зона: включаем при HP <= zoneHp, снимаем когда пропали все цели
 	-- или когда HP выше порога держится zoneRecover секунд ПОДРЯД, пока персонаж стоит в зоне
@@ -2194,7 +1887,6 @@ local function step(dt)
 
 	-- 1) Безопасная зона (высший приоритет)
 	if zoneActive then
-		progBestGap = nil
 		local p = root.Position
 		if pointInZone(p) then
 			hum:Move(Vector3.zero, false)
@@ -2235,7 +1927,6 @@ local function step(dt)
 
 	-- 2) Отход от цели при низком HP (смотрим на цель, пятимся)
 	if retreating then
-		progBestGap = nil
 		local away = -flat
 		if away.Magnitude < 0.1 then
 			local look = root.CFrame.LookVector
@@ -2249,94 +1940,7 @@ local function step(dt)
 		return
 	end
 
-	-- 3) Особый маршрут боссов (The Undying Guardian / The Spooky Knight)
-	local spec = bossSpec(target)
-	if spec then
-		if bossTarget ~= target then
-			bossTarget = target
-			bossEngaged = false
-			bossCorner = nil
-			bossPhaseSince = now
-			if state.bossApproachFirst then
-				bossPhase = "approach"
-				local d = (target.root.Position - root.Position).Magnitude
-				bossLimit = BOSS_APPROACH_BASE + (d / math.max(state.glideSpeed, 1)) * 1.5
-			else
-				bossPhase = "hold"
-			end
-		end
-		if bossPhase == "approach" and now - bossPhaseSince > bossLimit then
-			bossPhase = "hold" -- не дошли за отведённое время — всё равно уходим в зону
-		end
-
-		if bossPhase == "hold" then
-			progBestGap = nil
-			ghostTarget = nil
-			local p = root.Position
-			local tpos = target.root.Position
-
-			-- всегда остаёмся в зоне; если вышли — возвращаемся
-			if not pointInZone(p) then
-				glideToPoint(hum, root, zoneGoalPoint(p), dt)
-				setStatus("Босс: иду в зону", C.yellow)
-				checkStuck(hum, root, dt, true)
-				return
-			end
-
-			-- босс в зоне или рядом с ней? (с гистерезисом, чтобы не дёргаться на границе)
-			local zd = zoneDistance(tpos)
-			local near
-			if bossEngaged then
-				near = zd <= state.bossMargin + BOSS_HYST
-			else
-				near = zd <= state.bossMargin
-			end
-			bossEngaged = near
-
-			if near then
-				-- подходим к боссу, не выходя из зоны
-				if edgeGap(target, root) <= state.stopDist then
-					hum:Move(Vector3.zero, false)
-					applyGlide(root, Vector3.zero, dt)
-					stuckTime = 0
-					setStatus("Босс: бью из зоны", C.yellow)
-				else
-					glideToPoint(hum, root, clampToZone(tpos), dt)
-					setStatus("Босс: подхожу из зоны", C.yellow)
-					checkStuck(hum, root, dt, true)
-				end
-				return
-			end
-
-			-- босс далеко от зоны
-			if spec.corner then
-				-- Undying Guardian: ждём в самом дальнем от него углу
-				if not bossCorner or now - bossCornerAt > 1.5 then
-					local idx, d = farCornerIndex(tpos)
-					if not bossCorner then
-						bossCorner = idx
-					elseif idx ~= bossCorner and d > flatDist(ZONE_POINTS[bossCorner], tpos) + 6 then
-						bossCorner = idx -- меняем угол только если новый заметно дальше
-					end
-					bossCornerAt = now
-				end
-				glideToPoint(hum, root, cornerPoint(bossCorner), dt)
-				setStatus("Босс: жду в дальнем углу", C.yellow)
-			else
-				-- Spooky Knight: просто стоим в зоне
-				hum:Move(Vector3.zero, false)
-				applyGlide(root, Vector3.zero, dt)
-				stuckTime = 0
-				setStatus("Босс: жду в зоне", C.yellow)
-			end
-			return
-		end
-		-- фаза "approach": обычное движение к боссу ниже
-	else
-		bossTarget, bossPhase = nil, nil
-	end
-
-	-- 4) Обычное движение к цели
+	-- 3) Обычное движение к цели
 	local gap = edgeGap(target, root)
 	local remaining = gap - state.stopDist
 
@@ -2344,13 +1948,9 @@ local function step(dt)
 		hum:Move(Vector3.zero, false)
 		applyGlide(root, Vector3.zero, dt)
 		stuckTime = 0
-		progBestGap = nil
-		if bossPhase == "approach" then
-			bossPhase = "hold" -- дошли до босса — сразу уходим в зону
-		end
 		setStatus("У цели: " .. target.name, C.text)
 
-		-- страж «у цели»: HP не меняется и цель не двигается -> «призрак»
+		-- страж: мы стоим у цели, а её HP не меняется и она не двигается -> цель «зависла»
 		if state.ghostFilter then
 			local sig = hpSignature(target.inst)
 			local tpos = target.root.Position
@@ -2360,11 +1960,11 @@ local function step(dt)
 				if sig ~= ghostSig or (tpos - ghostPos).Magnitude > 0.5 then
 					ghostSince, ghostSig, ghostPos = now, sig, tpos
 				end
-				-- если у цели нет данных о HP — ждём вдвое дольше
-				local limit = (sig ~= nil) and state.ghostSeconds or state.ghostSeconds * 2
-				if now - ghostSince >= limit then
-					banTarget(target, ("стоим у цели %d с, она не меняется"):format(limit))
-					return
+				if sig ~= nil and now - ghostSince >= state.ghostSeconds then
+					blacklist[target.inst] = now + GHOST_BAN_SECONDS
+					ghostTarget = nil
+					currentTarget = nil
+					setStatus("Пропущена зависшая цель: " .. target.name, C.yellow)
 				end
 			end
 		end
@@ -2372,17 +1972,6 @@ local function step(dt)
 	end
 
 	ghostTarget = nil
-
-	-- страж прогресса: зазор должен уменьшаться, иначе цель недоступна / «призрак»
-	if state.progressCheck then
-		if progBestGap == nil or gap < progBestGap - 1.0 then
-			progBestGap, progSince = gap, now
-		elseif now - progSince >= state.ghostSeconds then
-			banTarget(target, ("нет прогресса в приближении %d с (зазор %.1f)"):format(state.ghostSeconds, gap))
-			return
-		end
-	end
-
 	local dir = flat.Unit
 	local speed = approachSpeed(remaining)
 	hum:Move(dir, false)
@@ -2533,10 +2122,6 @@ local function shutdown()
 	table.clear(npcHumanoids)
 	candidates = {}
 	currentTarget = nil
-	for _, c in ipairs(hookConns) do
-		pcall(function() c:Disconnect() end)
-	end
-	table.clear(hookConns)
 	markerGui:Destroy()
 	gui:Destroy()
 end
@@ -2671,6 +2256,14 @@ do
 	addToggle(p, "Прыжок при застревании", function() return state.autoJump end, function(v)
 		state.autoJump = v
 	end)
+	addToggle(p, "Пропуск зависших целей", function() return state.ghostFilter end, function(v)
+		state.ghostFilter = v
+	end)
+	addNumber(p, "Зависание цели, с", {
+		get = function() return state.ghostSeconds end,
+		set = function(v) state.ghostSeconds = v end,
+		step = 1, min = 3, max = 120, dec = 0,
+	})
 
 	addSection(p, "КАМЕРА")
 	addNumber(p, "Высота камеры", {
@@ -2679,122 +2272,6 @@ do
 		step = 1, min = 5, max = 300, dec = 0,
 	})
 	addNote(p, "Кнопка «ВИД СВЕРХУ» находится на вкладке ГЛАВНАЯ.", 28)
-
-	addSection(p, "ЗАЩИТА ОТ «ПРИЗРАКОВ»")
-	addToggle(p, "События смерти цели", function() return state.deathEvents end, function(v)
-		state.deathEvents = v
-	end)
-	addToggle(p, "Цель вне карты", function() return state.posCheck end, function(v)
-		state.posCheck = v
-	end)
-	addToggle(p, "Цель невидима", function() return state.visCheck end, function(v)
-		state.visCheck = v
-	end)
-	addToggle(p, "Нет прогресса к цели", function() return state.progressCheck end, function(v)
-		state.progressCheck = v
-	end)
-	addToggle(p, "Цель не меняется рядом", function() return state.ghostFilter end, function(v)
-		state.ghostFilter = v
-	end)
-	addToggle(p, "Нет анимаций (эксперимент)", function() return state.animCheck end, function(v)
-		state.animCheck = v
-	end)
-	addNumber(p, "Ожидание стража, с", {
-		get = function() return state.ghostSeconds end,
-		set = function(v) state.ghostSeconds = v end,
-		step = 1, min = 3, max = 120, dec = 0,
-	})
-
-	addSection(p, "ДИАГНОСТИКА ЦЕЛИ")
-	local diagLabel = Instance.new("TextLabel")
-	diagLabel.BackgroundColor3 = C.card
-	diagLabel.BorderSizePixel = 0
-	diagLabel.Size = UDim2.new(1, 0, 0, 0)
-	diagLabel.AutomaticSize = Enum.AutomaticSize.Y
-	diagLabel.Font = Enum.Font.Code
-	diagLabel.TextSize = 10
-	diagLabel.TextColor3 = C.text
-	diagLabel.TextXAlignment = Enum.TextXAlignment.Left
-	diagLabel.TextYAlignment = Enum.TextYAlignment.Top
-	diagLabel.TextWrapped = true
-	diagLabel.Text = "Когда скрипт идёт к «призраку», нажми «Снимок цели», затем «Копировать» и пришли текст. «Последний бан» показывает причину последнего автопропуска."
-	diagLabel.LayoutOrder = nextOrder(p)
-	diagLabel.Parent = p.frame
-	Instance.new("UICorner", diagLabel).CornerRadius = UDim.new(0, 8)
-	do
-		local dpad = Instance.new("UIPadding", diagLabel)
-		dpad.PaddingTop = UDim.new(0, 6)
-		dpad.PaddingBottom = UDim.new(0, 6)
-		dpad.PaddingLeft = UDim.new(0, 8)
-		dpad.PaddingRight = UDim.new(0, 8)
-	end
-	local diagText = diagLabel.Text
-
-	local function showDiag(text)
-		diagText = text
-		diagLabel.Text = text
-	end
-
-	local function copyText(text)
-		if setclipboard then
-			pcall(setclipboard, text)
-			return true
-		end
-		if toclipboard then
-			pcall(toclipboard, text)
-			return true
-		end
-		if writefile then
-			pcall(writefile, "WebValley_diag.txt", text)
-			return true
-		end
-		return false
-	end
-
-	local drow = Instance.new("Frame")
-	drow.Size = UDim2.new(1, 0, 0, 30)
-	drow.BackgroundTransparency = 1
-	drow.LayoutOrder = nextOrder(p)
-	drow.Parent = p.frame
-
-	local snapBtn = makeButton(drow, "Снимок цели", C.btn, C.text, UDim2.new(1 / 3, -4, 1, 0))
-	snapBtn.TextSize = 11
-	local banBtn = makeButton(drow, "Последний бан", C.btn, C.text, UDim2.new(1 / 3, -4, 1, 0))
-	banBtn.Position = UDim2.new(1 / 3, 2, 0, 0)
-	banBtn.TextSize = 11
-	local copyBtn = makeButton(drow, "Копировать", C.yellow, C.black, UDim2.new(1 / 3, -4, 1, 0))
-	copyBtn.Position = UDim2.new(2 / 3, 4, 0, 0)
-	copyBtn.TextSize = 11
-
-	track(snapBtn.Activated:Connect(function()
-		local target = currentTarget
-		if not target then
-			local root = getMyRoot()
-			if root then
-				target = findNearest(root.Position)
-			end
-		end
-		if target then
-			showDiag("СНИМОК ЦЕЛИ\n" .. describeTarget(target))
-		else
-			showDiag("Цели сейчас нет.")
-		end
-	end))
-	track(banBtn.Activated:Connect(function()
-		local entry = banLog[1]
-		if entry then
-			showDiag(("ПОСЛЕДНИЙ БАН: %s\nПричина: %s\n%s"):format(entry.name, entry.reason, entry.dump))
-		else
-			showDiag("Автопропусков пока не было.")
-		end
-	end))
-	track(copyBtn.Activated:Connect(function()
-		local ok = copyText(diagText)
-		copyBtn.Text = ok and "Скопировано" or "Недоступно"
-		task.delay(1.2, function()
-			copyBtn.Text = "Копировать"
-		end)
-	end))
 
 	addSection(p, "ЗДОРОВЬЕ")
 	addToggle(p, "Отход при низком HP", function() return state.retreat end, function(v)
@@ -2997,26 +2474,6 @@ do
 		queueSave()
 		if refreshPriorityList then refreshPriorityList() end
 	end)
-
-	addSection(p, "БОССЫ — ОСОБЫЙ МАРШРУТ")
-	addToggle(p, "The Undying Guardian", function() return state.bossGuardian end, function(v)
-		state.bossGuardian = v
-	end)
-	addToggle(p, "The Spooky Knight", function() return state.bossKnight end, function(v)
-		state.bossKnight = v
-	end)
-	addToggle(p, "Сначала подойти к боссу", function() return state.bossApproachFirst end, function(v)
-		state.bossApproachFirst = v
-	end)
-	addToggle(p, "Боссы — высший приоритет", function() return state.bossAutoPriority end, function(v)
-		state.bossAutoPriority = v
-	end)
-	addNumber(p, "Запас у зоны, м", {
-		get = function() return state.bossMargin end,
-		set = function(v) state.bossMargin = v end,
-		step = 1, min = 0, max = 60, dec = 0,
-	})
-	addNote(p, "Маршрут: подойти к боссу → уйти в зону и не выходить. Guardian: ждать в дальнем углу, пока босс не подойдёт к зоне. Knight: просто оставаться в зоне. Босс остаётся целью, пока жив. Чтобы босс выбирался, задай ему приоритет (список ниже) или включи «Боссы — высший приоритет».", 112)
 
 	local listHeader = addSection(p, "ЦЕЛИ  ( ● — сейчас рядом )")
 
