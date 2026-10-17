@@ -1,5 +1,9 @@
 --[[
-    WEB VALLEY STUDIO — NPC Walker v18
+    WEB VALLEY STUDIO — NPC Walker v19
+
+    v19: действия после смерти (клавиши 2 → 1, Ready, клик в точку) запускаются только после ПОСЛЕДНЕГО
+         ресета цикла сброса. Смерти от промежуточных ресетов их не запускают и отменяют старые,
+         а нажатия клавиш больше не накладываются друг на друга.
 
     v18:
       • Бан при бездействии: если персонаж не двигался N минут (по умолчанию 6), текущая цель,
@@ -753,21 +757,28 @@ pcall(function()
 end)
 
 function M.pressKey(keyCode, vk)
+	-- ждём, пока закончится предыдущее нажатие (чтобы клавиши не накладывались)
+	local waited = 0
+	while M.keyBusy and waited < 1 do
+		waited += task.wait(0.01)
+	end
+	M.keyBusy = true
+	local done = false
 	if M.VIM then
-		local ok = pcall(function()
+		done = pcall(function()
 			M.VIM:SendKeyEvent(true, keyCode, false, game)
 			task.wait(0.08) -- удерживаем чуть дольше: короткие нажатия игра иногда не замечает
 			M.VIM:SendKeyEvent(false, keyCode, false, game)
 		end)
-		if ok then return end
 	end
-	if keypress and keyrelease then
+	if not done and keypress and keyrelease then
 		pcall(function()
 			keypress(vk)
 			task.wait(0.08)
 			keyrelease(vk)
 		end)
 	end
+	M.keyBusy = false
 end
 
 function M.isCharAlive()
@@ -863,14 +874,25 @@ function M.runResetCycle()
 		local total = math.max(1, math.floor(state.resetPerCycle + 0.5))
 		for i = 1, total do
 			if not state.alive then break end
+			local isLast = (i == total)
+			M.suppressDeath = not isLast -- смерти от промежуточных ресетов не запускают клики
+			local before = M.deathToken
 			M.resetCharacter()
-			if i < total then
+			if isLast then
+				-- если событие смерти не пришло (персонаж уже был мёртв) — запускаем действия сами
+				task.wait(0.6)
+				if state.alive and state.farm and M.deathToken == before then
+					M.deathToken += 1
+					M.startDeathActions(M.deathToken)
+				end
+			else
 				local t0 = os.clock()
 				while state.alive and os.clock() - t0 < state.resetDelay do
 					task.wait(0.1)
 				end
 			end
 		end
+		M.suppressDeath = false
 		M.resetBusy = false
 		if M.refreshResetInfo then M.refreshResetInfo() end
 	end)
@@ -901,12 +923,12 @@ end
 -- Фарм: действия после смерти
 ------------------------------------------------------------
 M.deathToken = 0
+M.suppressDeath = false -- true на время промежуточных ресетов цикла
+M.keyBusy = false       -- простая блокировка: одна клавиша за раз
 M.diedConn = nil
 
-function M.onDeath()
-	if not state.alive or not state.farm then return end
-	M.deathToken += 1
-	local token = M.deathToken
+-- действия после смерти для «поколения» token (отменяются, если наступила новая смерть)
+function M.startDeathActions(token)
 	local function active()
 		return state.alive and state.farm and token == M.deathToken
 	end
@@ -970,6 +992,14 @@ function M.onDeath()
 			end
 		end)
 	end
+end
+
+-- событие смерти персонажа
+function M.onDeath()
+	if not state.alive or not state.farm then return end
+	M.deathToken += 1 -- отменяем действия предыдущей смерти
+	if M.suppressDeath then return end -- промежуточный ресет цикла: действия только после последнего
+	M.startDeathActions(M.deathToken)
 end
 
 function M.hookCharacter(char)
@@ -3341,7 +3371,7 @@ do
 	M.addButton(p, "Запустить цикл сейчас", C.btn, C.text, 32, function()
 		M.runResetCycle()
 	end)
-	M.addNote(p, "Каждые N пропаданий всех целей: цикл из нескольких ресетов — первый сразу, остальные через паузу.", 52)
+	M.addNote(p, "Каждые N пропаданий всех целей: цикл из нескольких ресетов — первый сразу, остальные через паузу. Клавиши 2 → 1, Ready и клик после смерти запускаются только после ПОСЛЕДНЕГО ресета цикла.", 78)
 
 	M.addSection(p, "АВТО-СБРОС ФАРМА (FPS)")
 	M.addToggle(p, ("Сброс фарма: FPS ≤ %d (%d с)"):format(M.FPS_RESET_BELOW, M.FPS_LOW_SECONDS),
